@@ -59,6 +59,7 @@ class YahooCollector(BaseCollector):
         delay=0,
         check_data_length: int = None,
         limit_nums: int = None,
+        symbol_list=None,
     ):
         """
 
@@ -82,6 +83,8 @@ class YahooCollector(BaseCollector):
             check data length, by default None
         limit_nums: int
             using for debug, by default None
+        symbol_list: Iterable
+            specified symbols to collect, by default None
         """
         super(YahooCollector, self).__init__(
             save_dir=save_dir,
@@ -93,6 +96,7 @@ class YahooCollector(BaseCollector):
             delay=delay,
             check_data_length=check_data_length,
             limit_nums=limit_nums,
+            symbol_list=symbol_list,
         )
 
         self.init_datetime()
@@ -263,6 +267,10 @@ class YahooCollectorCN1min(YahooCollectorCN):
 
 class YahooCollectorUS(YahooCollector, ABC):
     def get_instrument_list(self):
+        if self.symbol_list:
+            symbols = [s.strip().upper() for s in self.symbol_list if s.strip()]
+            logger.info(f"get specified US stock symbols: {symbols}......")
+            return symbols
         logger.info("get US stock symbols......")
         symbols = get_us_stock_symbols() + [
             "^GSPC",
@@ -722,6 +730,7 @@ class YahooNormalizeBR1min(YahooNormalizeBR, YahooNormalize1min):
 
 class Run(BaseRun):
     def __init__(self, source_dir=None, normalize_dir=None, max_workers=1, interval="1d", region=REGION_CN):
+    def __init__(self, source_dir=None, normalize_dir=None, max_workers=1, interval="1d", region=REGION_CN, target_dir=None):
         """
 
         Parameters
@@ -736,8 +745,11 @@ class Run(BaseRun):
             freq, value from [1min, 1d], default 1d
         region: str
             region, value from ["CN", "US", "BR"], default "CN"
+        target_dir: str
+            Root storage directory, by default None
         """
         super().__init__(source_dir, normalize_dir, max_workers, interval)
+        super().__init__(source_dir, normalize_dir, max_workers, interval, target_dir=target_dir)
         self.region = region
 
     @property
@@ -760,6 +772,8 @@ class Run(BaseRun):
         end=None,
         check_data_length=None,
         limit_nums=None,
+        symbol_list=None,
+        symbol_file=None,
     ):
         """download data from Internet
 
@@ -777,6 +791,10 @@ class Run(BaseRun):
             check data length, if not None and greater than 0, each symbol will be considered complete if its data length is greater than or equal to this value, otherwise it will be fetched again, the maximum number of fetches being (max_collector_count). By default None.
         limit_nums: int
             using for debug, by default None
+        symbol_list: Iterable
+            specified symbols to collect, by default None
+        symbol_file: str, Path
+            file containing symbols to collect, by default None
 
         Notes
         -----
@@ -795,7 +813,16 @@ class Run(BaseRun):
         if self.interval == "1d" and pd.Timestamp(end) > pd.Timestamp(datetime.datetime.now().strftime("%Y-%m-%d")):
             raise ValueError(f"end_date: {end} is greater than the current date.")
 
-        super(Run, self).download_data(max_collector_count, delay, start, end, check_data_length, limit_nums)
+        super(Run, self).download_data(
+            max_collector_count=max_collector_count,
+            delay=delay,
+            start=start,
+            end=end,
+            check_data_length=check_data_length,
+            limit_nums=limit_nums,
+            symbol_list=symbol_list,
+            symbol_file=symbol_file,
+        )
 
     def normalize_data(
         self,

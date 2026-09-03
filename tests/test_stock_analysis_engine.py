@@ -1,0 +1,300 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Unit and Integration Tests for Stock Performance & Predictive Buy Timing Engine
+==============================================================================
+"""
+
+import sys
+import tempfile
+import unittest
+import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# Add repo root and scripts directory to sys.path
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+from stock_analysis_engine import (
+    load_stock_data,
+    is_data_up_to_date,
+    compute_performance_summary,
+    detect_historical_best_buys,
+    predict_future_buy_timing,
+    compute_multi_period_projections,
+    run_stock_analysis,
+    _standardize_stock_df,
+)
+from visualize_stock_analysis import generate_html_dashboard, resolve_report_path
+
+
+class TestStockAnalysisEngine(unittest.TestCase):
+    """Test suite for the stock analysis and predictive buy timing engine."""
+
+    def setUp(self):
+        """Generate a realistic synthetic 5-year stock price history."""
+        np.random.seed(42)
+        # 5 years of daily trading data (~1260 days)
+        dates = pd.bdate_range(start="2021-01-04", periods=1260).strftime("%Y-%m-%d")
+        
+        # Start at 100, add cyclical swings, upward drift, and dips
+        base_price = 100.0
+        prices = [base_price]
+        for i in range(1, len(dates)):
+            # Random walk with slight positive drift and periodic cycle
+            cycle = 0.005 * np.sin(i / 30.0)
+            ret = np.random.normal(0.0005, 0.015) + cycle
+            new_p = max(10.0, prices[-1] * (1.0 + ret))
+            prices.append(new_p)
+
+        self.df_synthetic = pd.DataFrame({
+            "date": dates,
+            "open": [p * 0.99 for p in prices],
+            "high": [p * 1.02 for p in prices],
+            "low": [p * 0.98 for p in prices],
+            "close": prices,
+            "volume": [1_000_000 + int(np.random.uniform(-200_000, 200_000)) for _ in prices],
+            "symbol": "TEST",
+        })
+
+    def test_standardize_stock_df(self):
+        """Test standardization of messy column names and non-sorted dates."""
+        messy_df = pd.DataFrame({
+            "Date": ["2024-01-05", "2024-01-02", "2024-01-03"],
+            "Close": [105.0, 100.0, 102.0],
+            "Volume": [1000, 2000, 1500],
+        })
+        std_df = _standardize_stock_df(messy_df, "TEST")
+        self.assertEqual(list(std_df["date"]), ["2024-01-02", "2024-01-03", "2024-01-05"])
+        self.assertTrue("open" in std_df.columns)
+        self.assertTrue("high" in std_df.columns)
+        self.assertTrue("low" in std_df.columns)
+
+    def test_compute_performance_summary(self):
+        """Test calculation of 1Y, 3Y, and 5Y performance metrics."""
+        summary = compute_performance_summary(self.df_synthetic, periods_years=[1, 3, 5])
+        
+        self.assertEqual(summary["symbol"], "TEST")
+        self.assertEqual(summary["total_history_days"], 1260)
+        
+        # Verify 1Y metrics
+        p1 = summary["periods"]["1Y"]
+        self.assertTrue(p1["available"])
+        self.assertGreater(p1["trading_days"], 200)
+        self.assertIn("total_return_pct", p1)
+        self.assertIn("cagr_pct", p1)
+        self.assertIn("max_drawdown_pct", p1)
+        self.assertLessEqual(p1["max_drawdown_pct"], 0.0)
+        self.assertIn("sharpe_ratio", p1)
+        self.assertIn("annual_volatility_pct", p1)
+
+        # Verify 3Y & 5Y metrics
+        p3 = summary["periods"]["3Y"]
+        p5 = summary["periods"]["5Y"]
+        self.assertTrue(p3["available"])
+        self.assertTrue(p5["available"])
+        self.assertGreater(p5["trading_days"], 1000)
+
+    def test_detect_historical_best_buys(self):
+        """Test identification of optimal historical buy points."""
+        best_buys = detect_historical_best_buys(self.df_synthetic, periods_years=[1, 3, 5])
+        
+        self.assertIn("1Y", best_buys)
+        self.assertIn("3Y", best_buys)
+        self.assertIn("5Y", best_buys)
+
+        # 5Y should have identified major troughs
+        buys_5y = best_buys["5Y"]
+        self.assertGreater(len(buys_5y), 0)
+        
+        first_buy = buys_5y[0]
+        self.assertIn("date", first_buy)
+        self.assertIn("price", first_buy)
+        self.assertIn("peak_date", first_buy)
+        self.assertIn("peak_price", first_buy)
+        self.assertIn("max_gain_pct", first_buy)
+        self.assertGreater(first_buy["max_gain_pct"], 0)
+        self.assertIn("rationale", first_buy)
+
+    def test_predict_future_buy_timing(self):
+        """Test 3-month forward predictive analysis."""
+        pred = predict_future_buy_timing(self.df_synthetic, forecast_days=63)
+        
+        self.assertEqual(pred["forecast_days"], 63)
+        self.assertIn("recommendation", pred)
+        self.assertIn("action_summary", pred)
+        self.assertIn("optimal_entry_range", pred)
+        self.assertEqual(len(pred["optimal_entry_range"]), 2)
+        self.assertLessEqual(pred["optimal_entry_range"][0], pred["optimal_entry_range"][1])
+        
+        self.assertIn("optimal_buy_window", pred)
+        self.assertIn("start_date", pred["optimal_buy_window"])
+        self.assertIn("end_date", pred["optimal_buy_window"])
+        
+        self.assertIn("target_price_3m", pred)
+        self.assertIn("expected_return_pct", pred)
+        self.assertIn("stop_loss", pred)
+        self.assertIn("risk_reward_ratio", pred)
+
+        # Verify forecast series
+        series = pred["forecast_series"]
+        self.assertEqual(len(series), 63)
+        self.assertLessEqual(series[0]["bear_p10"], series[0]["bull_p90"])
+
+    def test_load_stock_data_from_csv(self):
+        """Test loading from custom CSV directory structure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            source_dir = data_dir / "source"
+            source_dir.mkdir()
+            
+            csv_path = source_dir / "AAPL.csv"
+            self.df_synthetic.to_csv(csv_path, index=False)
+            
+            max_date = self.df_synthetic["date"].max()
+            loaded_df = load_stock_data("AAPL", data_dir, request_date=max_date)
+            self.assertEqual(len(loaded_df), 1260)
+            self.assertEqual(loaded_df["symbol"].iloc[0], "AAPL")
+
+    def test_html_dashboard_generation(self):
+        """Test end-to-end HTML visual dashboard output."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            (data_dir / "AAPL.csv").write_text(self.df_synthetic.to_csv(index=False), encoding="utf-8")
+
+            max_date = self.df_synthetic["date"].max()
+            analysis = run_stock_analysis("AAPL", data_dir, forecast_days=63, request_date=max_date)
+            report_path = data_dir / "report.html"
+            
+            out_file = generate_html_dashboard(analysis, report_path)
+            self.assertTrue(out_file.exists())
+            
+            content = out_file.read_text(encoding="utf-8")
+            self.assertIn("AAPL", content)
+            self.assertIn("Historical Performance & Best Times to Buy", content)
+            self.assertIn("3-Month Predictive Buy Analysis", content)
+            self.assertIn("Historical Best Buy Opportunities Ranked", content)
+            self.assertIn("optimal_buy_window", content)
+            # Verify 'Historical' instead of 'Horizon'
+            self.assertIn("1-Year Historical", content)
+            self.assertIn("3-Year Historical", content)
+            self.assertIn("5-Year Historical", content)
+            self.assertNotIn("1-Year Horizon", content)
+            # Verify Forward Return Projections row
+            self.assertIn("Forward Return Projections &amp; Probability Analysis", content)
+            self.assertIn("Probability Score", content)
+
+    def test_multi_period_projections(self):
+        """Test 6M, 1Y, 2Y, and 3Y multi-period return projections and probability scoring."""
+        proj = compute_multi_period_projections(self.df_synthetic)
+        self.assertIsInstance(proj, dict)
+        self.assertEqual(set(proj.keys()), {"6M", "1Y", "2Y", "3Y"})
+
+        for key in ["6M", "1Y", "2Y", "3Y"]:
+            item = proj[key]
+            self.assertIn("projected_return_pct", item)
+            self.assertIn("projected_cagr_pct", item)
+            self.assertIn("base_target_price", item)
+            self.assertIn("bear_price", item)
+            self.assertIn("bull_price", item)
+            self.assertIn("probability_score", item)
+            self.assertIn("confidence", item)
+
+            self.assertGreater(item["base_target_price"], 0)
+            self.assertLessEqual(item["bear_price"], item["bull_price"])
+            self.assertGreaterEqual(item["probability_score"], 0.0)
+            self.assertLessEqual(item["probability_score"], 100.0)
+            self.assertIsInstance(item["confidence"], str)
+
+    def test_auto_download_missing_symbol(self):
+        """Test that missing symbol raises FileNotFoundError if auto_download=False."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with self.assertRaises(FileNotFoundError):
+                load_stock_data("NONEXISTENT", data_dir, auto_download=False)
+
+    def test_resolve_report_path(self):
+        """Test default and custom report directory path resolution with request date."""
+        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        # 1. Default directory ('reports')
+        p_default = resolve_report_path("MSFT")
+        self.assertEqual(p_default.name, f"MSFT_analysis_report_{today_str}.html")
+        self.assertEqual(p_default.parent.name, "reports")
+
+        # Custom date string
+        p_custom_date = resolve_report_path("MSFT", report_date="2026-01-15")
+        self.assertEqual(p_custom_date.name, "MSFT_analysis_report_2026-01-15.html")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            custom_dir = (Path(tmpdir) / "custom_reports").resolve()
+            
+            # 2. Custom report_dir
+            p_custom = resolve_report_path("NVDA", report_dir=custom_dir)
+            self.assertEqual(p_custom.name, f"NVDA_analysis_report_{today_str}.html")
+            self.assertEqual(p_custom.parent, custom_dir)
+            self.assertTrue(custom_dir.exists())
+
+            # 3. Custom output file (.html)
+            specific_file = (Path(tmpdir) / "my_report.html").resolve()
+            p_file = resolve_report_path("AAPL", output=specific_file)
+            self.assertEqual(p_file, specific_file)
+
+            # 4. Custom output directory (without .html extension)
+            dir_output = (Path(tmpdir) / "dir_output").resolve()
+            p_dir_out = resolve_report_path("TSLA", output=dir_output)
+            self.assertEqual(p_dir_out.name, f"TSLA_analysis_report_{today_str}.html")
+    def test_is_data_up_to_date(self):
+        """Test data freshness checking logic across weekdays and weekends."""
+        max_date = self.df_synthetic["date"].max()
+
+        # 1. Exact match with max_date -> Fresh
+        is_fresh, latest, expected = is_data_up_to_date(self.df_synthetic, request_date=max_date)
+        self.assertTrue(is_fresh)
+        self.assertEqual(latest, max_date)
+        self.assertEqual(expected, max_date)
+
+        # 2. Past date -> Fresh
+        is_fresh, latest, expected = is_data_up_to_date(self.df_synthetic, request_date="2022-06-15")
+        self.assertTrue(is_fresh)
+
+        # 3. Future date -> Stale
+        future_req = "2028-12-01"
+        is_fresh, latest, expected = is_data_up_to_date(self.df_synthetic, request_date=future_req)
+        self.assertFalse(is_fresh)
+        self.assertEqual(expected, future_req)
+
+        # 4. Weekend check: Saturday request looks for Friday
+        # 2026-09-05 is Saturday -> expected Friday 2026-09-04
+        # If df has data up to 2026-09-04, Saturday request is up-to-date
+        df_friday = pd.DataFrame({"date": ["2026-09-04"], "close": [100.0]})
+        is_fresh, latest, expected = is_data_up_to_date(df_friday, request_date="2026-09-05")
+        self.assertTrue(is_fresh)
+        self.assertEqual(expected, "2026-09-04")
+
+        # 5. Weekend check: Sunday request looks for Friday
+        is_fresh, latest, expected = is_data_up_to_date(df_friday, request_date="2026-09-06")
+        self.assertTrue(is_fresh)
+        self.assertEqual(expected, "2026-09-04")
+
+    def test_freshness_in_run_stock_analysis(self):
+        """Test that run_stock_analysis includes freshness verification metadata."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            (data_dir / "AAPL.csv").write_text(self.df_synthetic.to_csv(index=False), encoding="utf-8")
+
+            max_date = self.df_synthetic["date"].max()
+            analysis = run_stock_analysis("AAPL", data_dir, auto_download=False, request_date=max_date)
+            
+            self.assertTrue(analysis["is_up_to_date"])
+            self.assertEqual(analysis["latest_data_date"], max_date)
+            self.assertEqual(analysis["request_date"], max_date)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

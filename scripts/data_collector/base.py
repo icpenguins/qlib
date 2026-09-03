@@ -40,6 +40,7 @@ class BaseCollector(abc.ABC):
         delay=0,
         check_data_length: int = None,
         limit_nums: int = None,
+        symbol_list: Iterable = None,
     ):
         """
 
@@ -63,6 +64,8 @@ class BaseCollector(abc.ABC):
             check data length, if not None and greater than 0, each symbol will be considered complete if its data length is greater than or equal to this value, otherwise it will be fetched again, the maximum number of fetches being (max_collector_count). By default None.
         limit_nums: int
             using for debug, by default None
+        symbol_list: Iterable
+            specified symbols to collect, by default None
         """
         self.save_dir = Path(save_dir).expanduser().resolve()
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -73,6 +76,23 @@ class BaseCollector(abc.ABC):
         self.mini_symbol_map = {}
         self.interval = interval
         self.check_data_length = max(int(check_data_length) if check_data_length is not None else 0, 0)
+
+        if symbol_list is not None:
+            candidate_p = Path(str(symbol_list).strip().strip('"\'')).expanduser()
+            if candidate_p.is_file():
+                symbols = []
+                with open(candidate_p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip().split("#")[0].strip()
+                        if line:
+                            symbols.extend(line.replace(",", " ").split())
+                self.symbol_list = [s.strip().strip("'\"").upper() for s in symbols if s.strip()]
+            elif isinstance(symbol_list, str):
+                self.symbol_list = [s.strip().strip("'\"").upper() for s in symbol_list.split(",") if s.strip()]
+            else:
+                self.symbol_list = [str(s).strip().strip("'\"").upper() for s in symbol_list if str(s).strip()]
+        else:
+            self.symbol_list = None
 
         self.start_datetime = self.normalize_start_datetime(start)
         self.end_datetime = self.normalize_end_datetime(end)
@@ -334,6 +354,7 @@ class Normalize:
 
 class BaseRun(abc.ABC):
     def __init__(self, source_dir=None, normalize_dir=None, max_workers=1, interval="1d"):
+    def __init__(self, source_dir=None, normalize_dir=None, max_workers=1, interval="1d", target_dir=None):
         """
 
         Parameters
@@ -346,14 +367,23 @@ class BaseRun(abc.ABC):
             Concurrent number, default is 1; Concurrent number, default is 1; when collecting data, it is recommended that max_workers be set to 1
         interval: str
             freq, value from [1min, 1d], default 1d
+        target_dir: str
+            Root storage directory, by default None
         """
+        if target_dir is not None:
+            base_dir = Path(target_dir).expanduser().resolve()
+        else:
+            base_dir = Path(self.default_base_dir)
+
         if source_dir is None:
             source_dir = Path(self.default_base_dir).joinpath("source")
+            source_dir = base_dir.joinpath("source")
         self.source_dir = Path(source_dir).expanduser().resolve()
         self.source_dir.mkdir(parents=True, exist_ok=True)
 
         if normalize_dir is None:
             normalize_dir = Path(self.default_base_dir).joinpath("normalize")
+            normalize_dir = base_dir.joinpath("normalize")
         self.normalize_dir = Path(normalize_dir).expanduser().resolve()
         self.normalize_dir.mkdir(parents=True, exist_ok=True)
 
@@ -384,6 +414,8 @@ class BaseRun(abc.ABC):
         end=None,
         check_data_length: int = None,
         limit_nums=None,
+        symbol_list=None,
+        symbol_file=None,
         **kwargs,
     ):
         """download data from Internet
@@ -402,6 +434,10 @@ class BaseRun(abc.ABC):
             check data length, if not None and greater than 0, each symbol will be considered complete if its data length is greater than or equal to this value, otherwise it will be fetched again, the maximum number of fetches being (max_collector_count). By default None.
         limit_nums: int
             using for debug, by default None
+        symbol_list: Iterable
+            specified symbols to collect, by default None
+        symbol_file: str, Path
+            file containing symbols to collect, by default None
 
         Examples
         ---------
@@ -410,6 +446,8 @@ class BaseRun(abc.ABC):
             # get 1m data
             $ python collector.py download_data --source_dir ~/.qlib/instrument_data/source --region CN --start 2020-11-01 --end 2020-11-10 --delay 0.1 --interval 1m
         """
+        if symbol_file is not None and symbol_list is None:
+            symbol_list = symbol_file
 
         _class = getattr(self._cur_module, self.collector_class_name)  # type: Type[BaseCollector]
         _class(
@@ -422,6 +460,7 @@ class BaseRun(abc.ABC):
             interval=self.interval,
             check_data_length=check_data_length,
             limit_nums=limit_nums,
+            symbol_list=symbol_list,
             **kwargs,
         ).collector_data()
 
