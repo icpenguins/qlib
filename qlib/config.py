@@ -28,7 +28,15 @@ from qlib.constant import REG_CN, REG_US, REG_TW
 if TYPE_CHECKING:
     from qlib.utils.time import Freq
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+try:
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except ImportError:
+    class BaseSettings:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    def SettingsConfigDict(**kwargs):
+        return kwargs
 
 
 class MLflowSettings(BaseSettings):

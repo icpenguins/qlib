@@ -199,12 +199,115 @@ def generate_html_dashboard(
         </div>
         """
 
+    # Build market regime card HTML if available
+    regime = analysis_data.get("regime")
+    regime_html = ""
+    if regime:
+        cp_prob = regime.get("changepoint_prob_pct", 0.0)
+        cp_color = "text-emerald-400" if cp_prob < 25.0 else ("text-amber-400" if cp_prob < 50.0 else "text-red-400")
+        cp_bar_color = "bg-emerald-500" if cp_prob < 25.0 else ("bg-amber-500" if cp_prob < 50.0 else "bg-red-500")
+
+        regime_html = f"""
+    <!-- BAYESIAN ONLINE CHANGEPOINT DETECTION (BOCD) & MARKET REGIME ROW -->
+    <div class="bg-gray-950/70 border border-teal-900/40 rounded-2xl p-5 shadow-sm">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-teal-400 animate-pulse"></span>
+          <h2 class="text-xs font-bold text-teal-300 uppercase tracking-wider">Bayesian Online Changepoint Detection (BOCD) &amp; Macro Regime</h2>
+        </div>
+        <div class="text-[11px] text-gray-400 font-mono">
+          Model: Adams &amp; MacKay (2007) Conjugate Student-t &bull; Non-Stationary Time Series
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <!-- REGIME STATE CARD -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Market State</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {regime.get('badge_class', '')}">State {regime.get('state', 0)}</span>
+            </div>
+            <div class="text-lg font-black text-white mt-1">
+              {regime.get('name', 'N/A')}
+            </div>
+            <div class="text-xs font-semibold text-teal-400 mt-1">
+              {regime.get('action', '')}
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
+            {regime.get('description', '')}
+          </div>
+        </div>
+
+        <!-- BOCD CHANGEPOINT RISK -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Changepoint Hazard P(r=0)</span>
+              <span class="text-xs font-bold font-mono {cp_color}">{cp_prob:.1f}%</span>
+            </div>
+            <div class="text-2xl font-black text-white mt-1">
+              {regime.get('expected_run_length_days', 0):.0f} <span class="text-xs font-normal text-gray-400">Days Active</span>
+            </div>
+            <div class="w-full bg-gray-800 rounded-full h-1.5 overflow-hidden my-2.5">
+              <div class="h-full {cp_bar_color} rounded-full" style="width: {min(100, max(5, cp_prob))}%;"></div>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 space-y-1 font-mono">
+            <div class="flex justify-between"><span>Bull Prob:</span> <span class="text-emerald-400">{(regime.get('probabilities', {}).get('bull', 0)*100):.1f}%</span></div>
+            <div class="flex justify-between"><span>Risk-Off Prob:</span> <span class="text-red-400">{(regime.get('probabilities', {}).get('risk_off', 0)*100):.1f}%</span></div>
+          </div>
+        </div>
+
+        <!-- VOLATILITY SURFACE -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Realized Vol Surface</span>
+              <span class="text-xs font-bold font-mono {'text-red-400' if regime.get('vol_ratio', 1) > 1.15 else 'text-emerald-400'}">Ratio: {regime.get('vol_ratio', 1):.2f}x</span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              {regime.get('vol_21d_pct', 0):.1f}% <span class="text-xs font-normal text-gray-400">21d Ann. Vol</span>
+            </div>
+            <div class="text-[11px] text-gray-400 mt-1">
+              5d Vol: <span class="text-gray-200 font-mono">{regime.get('vol_5d_pct', 0):.1f}%</span> | Term: <span class="font-mono text-gray-200">{'Inverted (Stress)' if regime.get('vol_ratio', 1) > 1.15 else 'Normal / Contango'}</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2">
+            Status: <span class="text-gray-200 font-medium">{'Elevated short-term vol spike' if regime.get('vol_ratio', 1) > 1.15 else 'Stable volatility baseline'}</span>
+          </div>
+        </div>
+
+        <!-- MACRO CREDIT & SIZING -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Macro Risk Appetite</span>
+              <span class="text-xs font-bold font-mono {'text-emerald-400' if regime.get('credit_mom_pct', 0) >= 0 else 'text-amber-400'}">{'+' if regime.get('credit_mom_pct', 0) >= 0 else ''}{regime.get('credit_mom_pct', 0):.2f}%</span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              {regime.get('risk_multiplier', 1.0):.1f}x <span class="text-xs font-normal text-gray-400">Sizing Factor</span>
+            </div>
+            <div class="text-[11px] text-gray-400 mt-1">
+              Credit Momentum (HYG/IEI): <span class="font-mono {'text-emerald-400' if regime.get('credit_mom_pct', 0) >= 0 else 'text-amber-400'}">{'Expanding / Risk-On' if regime.get('credit_mom_pct', 0) >= 0 else 'Compressing / Defensive'}</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2">
+            Portfolio Allocation: <span class="text-gray-200 font-medium">{int(regime.get('risk_multiplier', 1.0)*100)}% standard exposure</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+
     # Convert payloads to JSON
     json_history = json.dumps(history_payload)
     json_best_buys = json.dumps(best_buys)
     json_predictive = json.dumps(pred)
     json_performance = json.dumps(perf)
     json_projections = json.dumps(projections)
+    json_regime = json.dumps(regime) if regime else "{}"
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -370,6 +473,8 @@ def generate_html_dashboard(
         </div>
       </div>
     </div>
+
+    {regime_html}
 
     <!-- FORWARD RETURN PROJECTIONS & PROBABILITY SCORES ROW -->
     <div class="bg-gray-950/60 border border-purple-900/30 rounded-2xl p-5 shadow-sm">
@@ -1556,6 +1661,17 @@ def main():
             print(f"[{y}] Return: {p_data['total_return_pct']:+.1f}% | CAGR: {p_data['cagr_pct']:.1f}% | Max DD: {p_data['max_drawdown_pct']:.1f}% | Sharpe: {p_data['sharpe_ratio']}")
         else:
             print(f"[{y}] {p_data.get('reason', 'N/A')}")
+
+    regime = analysis_data.get("regime")
+    if regime:
+        print("\n-------------------------------------------------------")
+        print(" BAYESIAN ONLINE CHANGEPOINT (BOCD) & MARKET REGIME")
+        print("-------------------------------------------------------")
+        print(f"Current State:      State {regime['state']} - {regime['name']}")
+        print(f"Action Guidance:    {regime['action']}")
+        print(f"Changepoint Hazard: {regime['changepoint_prob_pct']}% (Active Run-Length: {regime['expected_run_length_days']} days)")
+        print(f"Volatility Surface: 21d Vol: {regime['vol_21d_pct']}% | Term Ratio (5d/21d): {regime['vol_ratio']}x")
+        print(f"Macro Risk Sizing:  {regime['risk_multiplier']}x exposure (Credit momentum: {regime['credit_mom_pct']:+.2f}%)")
 
     proj = analysis_data.get("projections", {})
     if proj:

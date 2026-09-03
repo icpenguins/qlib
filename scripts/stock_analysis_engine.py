@@ -26,6 +26,21 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+# Ensure qlib/contrib is in sys.path for regime module
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent
+CONTRIB_DIR = REPO_ROOT / "qlib" / "contrib"
+if str(CONTRIB_DIR) not in sys.path:
+    sys.path.insert(0, str(CONTRIB_DIR))
+
+try:
+    from qlib.contrib.regime import MarketRegimeClassifier
+except Exception:
+    try:
+        from regime import MarketRegimeClassifier
+    except Exception:
+        MarketRegimeClassifier = None
+
 
 # ----------------------------------------------------------------------
 # 1. Data Ingestion Layer (Qlib Binary + CSV Discovery & Freshness)
@@ -886,7 +901,63 @@ def compute_multi_period_projections(
 
 
 # ----------------------------------------------------------------------
-# 6. Master Analysis Coordinator
+# 6. Market Regime & Changepoint Detection
+# ----------------------------------------------------------------------
+
+def detect_market_regime(
+    df: pd.DataFrame,
+    data_dir: Optional[Union[str, Path]] = None,
+    symbol: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], pd.DataFrame]:
+    """
+    Apply Bayesian Online Changepoint Detection (BOCD) and multi-horizon
+    realized volatility surface + macro credit spread analysis to classify market regime.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Stock DataFrame with 'date', 'close', and other OHLCV fields.
+    data_dir : Optional[Union[str, Path]]
+        Path to market data directory to locate HYG/IEI credit proxy CSVs.
+    symbol : Optional[str]
+        Current symbol being analyzed.
+
+    Returns
+    -------
+    Tuple[Optional[Dict[str, Any]], pd.DataFrame]
+        (regime_summary_dict, df_with_regime_features)
+    """
+    if MarketRegimeClassifier is None or df.empty or len(df) < 10:
+        return None, df
+
+    hyg_df = None
+    iei_df = None
+    if data_dir is not None:
+        try:
+            root_p = Path(data_dir).expanduser().resolve()
+            for cand in [root_p / "HYG.csv", root_p / "source" / "HYG.csv", root_p / "normalize" / "HYG.csv"]:
+                if cand.exists() and cand.is_file():
+                    hyg_df = pd.read_csv(cand)
+                    break
+            for cand in [root_p / "IEI.csv", root_p / "source" / "IEI.csv", root_p / "normalize" / "IEI.csv"]:
+                if cand.exists() and cand.is_file():
+                    iei_df = pd.read_csv(cand)
+                    break
+        except Exception as e:
+            logger.debug(f"Note loading credit ETFs: {e}")
+
+    try:
+        classifier = MarketRegimeClassifier(expected_run_length=63.0)
+        df_regime = classifier.analyze(df, hyg_df=hyg_df, iei_df=iei_df)
+        summary = classifier.get_current_regime_summary(df_regime)
+        return summary, df_regime
+    except Exception as e:
+        logger.warning(f"Market regime analysis encountered an exception: {e}")
+        return None, df
+
+
+# ----------------------------------------------------------------------
+# 7. Master Analysis Coordinator
 # ----------------------------------------------------------------------
 
 def run_stock_analysis(
@@ -899,7 +970,8 @@ def run_stock_analysis(
 ) -> Dict[str, Any]:
     """
     Execute full historical performance, optimal entry detection,
-    3-month forward predictive analysis, and multi-period return projections.
+    3-month forward predictive analysis, multi-period return projections,
+    and Bayesian Online Changepoint Detection (BOCD) market regime classification.
     Ensures that market data is up-to-date for the requested date before analyzing.
     """
     if request_date is None:
@@ -918,6 +990,11 @@ def run_stock_analysis(
     )
     is_fresh, latest_date, expected_date = is_data_up_to_date(df, request_date=req_date_str)
 
+    # 1. Market Regime & Bayesian Changepoint Analysis
+    regime_summary, df_enriched = detect_market_regime(df, data_dir=data_dir, symbol=symbol)
+    df = df_enriched
+
+    # 2. Performance, buy timing, and forward projections
     perf_summary = compute_performance_summary(df, periods_years=[1, 3, 5])
     best_buys = detect_historical_best_buys(df, periods_years=[1, 3, 5])
     predictive = predict_future_buy_timing(df, forecast_days=forecast_days)
@@ -935,5 +1012,6 @@ def run_stock_analysis(
         "best_buys": best_buys,
         "predictive": predictive,
         "projections": projections,
+        "regime": regime_summary,
     }
 
