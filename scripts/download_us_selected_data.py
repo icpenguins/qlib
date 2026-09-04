@@ -88,6 +88,19 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 ]
 
+# Mapping of common index/market benchmarks to Yahoo Finance symbols
+INDEX_ALIASES: Dict[str, str] = {
+    "SPX": "^GSPC",
+    "GSPC": "^GSPC",
+    "^SPX": "^GSPC",
+    "NDX": "^NDX",
+    "DJI": "^DJI",
+    "RUT": "^RUT",
+    "VIX": "^VIX",
+    "TNX": "^TNX",
+    "TYX": "^TYX",
+}
+
 
 def load_symbols_from_file(file_path: Union[str, Path]) -> List[str]:
     """
@@ -446,16 +459,28 @@ def download_raw_symbol(
     start_ts = int(start_dt.timestamp())
     end_ts = int(end_dt.timestamp())
 
-    # 1. Primary engine: Direct Yahoo v8 chart API
-    df = fetch_yahoo_v8_chart(symbol, start_ts, end_ts, interval=interval)
-    if df is not None and not df.empty:
-        return df
+    query_symbols = [symbol]
+    sym_upper = symbol.upper()
+    if sym_upper in INDEX_ALIASES:
+        alt = INDEX_ALIASES[sym_upper]
+        if alt not in query_symbols:
+            query_symbols.append(alt)
+    elif not symbol.startswith("^"):
+        query_symbols.append(f"^{sym_upper}")
 
-    # 2. Secondary fallback engine (yfinance / yahooquery)
-    logger.info(f"Attempting fallback data fetchers for {symbol}...")
-    df_fallback = fetch_fallback_engines(symbol, start, end, interval=interval)
-    if df_fallback is not None and not df_fallback.empty:
-        return df_fallback
+    for q_sym in query_symbols:
+        # 1. Primary engine: Direct Yahoo v8 chart API
+        df = fetch_yahoo_v8_chart(q_sym, start_ts, end_ts, interval=interval)
+        if df is not None and not df.empty:
+            df["symbol"] = symbol.upper()
+            return df
+
+        # 2. Secondary fallback engine (yfinance / yahooquery)
+        logger.info(f"Attempting fallback data fetchers for {q_sym}...")
+        df_fallback = fetch_fallback_engines(q_sym, start, end, interval=interval)
+        if df_fallback is not None and not df_fallback.empty:
+            df_fallback["symbol"] = symbol.upper()
+            return df_fallback
 
     return None
 
@@ -654,6 +679,7 @@ def run_pipeline(
     dump_qlib: bool = True,
     delay: float = 0.5,
     download_options: bool = False,
+    download_events: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     """
     Execute the full end-to-end data acquisition and processing pipeline.
@@ -778,6 +804,27 @@ def run_pipeline(
         except Exception as e:
             logger.warning(f"Error during option chain acquisition: {e}")
 
+    # Download corporate earnings & event calendars if requested
+    if download_events:
+        logger.info("Downloading corporate event calendars & PEAD history for targeted tickers...")
+        events_dir = (target_path / "events") if target_dir is not None else (source_path.parent / "events")
+        events_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            repo_root = Path(__file__).resolve().parent.parent
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            from qlib.contrib.events.events_data import EventsDataLoader
+
+            ev_loader = EventsDataLoader(data_dir=events_dir.parent)
+            for sym in cleaned_symbols:
+                try:
+                    logger.info(f"Downloading event calendar for {sym} to {events_dir}...")
+                    ev_loader.load_or_generate_events(sym, force_download=True)
+                except Exception as e:
+                    logger.warning(f"Failed downloading event calendar for {sym}: {e}")
+        except Exception as e:
+            logger.warning(f"Error during event calendar acquisition: {e}")
+
     # Print summary table
     print("\n" + "=" * 80)
     print(f"{'DOWNLOAD & NORMALIZATION SUMMARY':^80}")
@@ -882,6 +929,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Download and cache equity option chains for targeted tickers into <target_dir>/options.",
     )
+    parser.add_argument(
+        "--download_events",
+        action="store_true",
+        default=False,
+        help="Download and cache corporate earnings calendars and PEAD history for targeted tickers into <target_dir>/events.",
+    )
     return parser
 
 
@@ -912,6 +965,7 @@ def main():
         dump_qlib=args.dump_qlib,
         delay=args.delay,
         download_options=args.download_options,
+        download_events=args.download_events,
     )
 
 

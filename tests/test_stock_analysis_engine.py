@@ -462,6 +462,138 @@ class TestStockAnalysisEngine(unittest.TestCase):
             self.assertIn("call_wall_price", pred)
             self.assertIn("put_wall_price", pred)
 
+    def test_predict_future_buy_timing_event_risk_and_pead(self):
+        """Test buy timing adjustments under imminent event risk and active PEAD regimes."""
+        last_date = pd.to_datetime(self.df_synthetic["date"].iloc[-1])
+        next_earn_dt = last_date + datetime.timedelta(days=2)  # 1-2 business days away -> IMMINENT
+        next_earn_str = next_earn_dt.strftime("%Y-%m-%d")
+
+        imminent_events = {
+            "catalyst_status": {
+                "status_code": "IMMINENT_DEGROSS",
+                "days_to_earnings": 1,
+                "days_to_macro": 5,
+                "urgency_level": "CRITICAL",
+                "next_event_name": "Quarterly Earnings Report (Q1)",
+                "next_event_date": next_earn_str,
+            },
+            "degrossing": {
+                "position_haircut": 0.0,
+                "is_event_imminent": True,
+                "binary_gap_sd": 0.045,
+                "risk_advice": "Liquidate/hedge long delta prior to announcement",
+            },
+            "pead": {
+                "drift_regime": "NEUTRAL",
+                "sue_score": 0.0,
+                "pead_drift_boost": 0.0,
+                "recent_announcement_date": None,
+            },
+            "momentum_events": [],
+        }
+
+        pred_imminent = predict_future_buy_timing(
+            self.df_synthetic,
+            forecast_days=63,
+            events=imminent_events,
+        )
+
+        self.assertEqual(pred_imminent["catalyst_status"], "IMMINENT_DEGROSS")
+        self.assertEqual(pred_imminent["event_haircut"], 0.0)
+        self.assertIn("EVENT RISK / PRE-EARNINGS DE-GROSSING", pred_imminent["action_recommendation"])
+        self.assertIn("pre-event position de-grossing", pred_imminent["action_summary"])
+        # Optimal window start must be shifted past the earnings announcement
+        self.assertGreater(pd.to_datetime(pred_imminent["optimal_buy_window_start"]), pd.to_datetime(next_earn_str))
+
+        # Test Bullish PEAD accumulation regime
+        pead_events = {
+            "catalyst_status": {
+                "status_code": "SAFE",
+                "days_to_earnings": 45,
+                "days_to_macro": 20,
+                "urgency_level": "NORMAL",
+                "next_event_name": "Quarterly Earnings Report (Q2)",
+                "next_event_date": (last_date + datetime.timedelta(days=60)).strftime("%Y-%m-%d"),
+            },
+            "degrossing": {
+                "position_haircut": 1.0,
+                "is_event_imminent": False,
+                "binary_gap_sd": 0.0,
+                "risk_advice": "Normal risk budget",
+            },
+            "pead": {
+                "drift_regime": "BULLISH_PEAD",
+                "sue_score": 2.85,
+                "pead_drift_boost": 0.08,
+                "recent_announcement_date": (last_date - datetime.timedelta(days=5)).strftime("%Y-%m-%d"),
+            },
+            "momentum_events": [],
+        }
+
+        pred_pead = predict_future_buy_timing(
+            self.df_synthetic,
+            forecast_days=63,
+            events=pead_events,
+        )
+
+        self.assertEqual(pred_pead["pead_regime"], "BULLISH_PEAD")
+        self.assertEqual(pred_pead["event_haircut"], 1.0)
+        self.assertIn("PEAD POST-EARNINGS DRIFT ACCUMULATION", pred_pead["action_recommendation"])
+        self.assertIn("post-earnings bullish drift", pred_pead["action_summary"])
+
+    def test_multi_period_projections_with_events(self):
+        """Test multi-period forward projections conditioning on PEAD and event binary gap risk."""
+        events_input = {
+            "catalyst_status": {
+                "status_code": "APPROACHING",
+                "days_to_earnings": 4,
+            },
+            "degrossing": {
+                "position_haircut": 0.5,
+                "binary_gap_sd": 0.05,
+            },
+            "pead": {
+                "drift_regime": "BULLISH_PEAD",
+                "pead_drift_boost": 0.06,
+            },
+        }
+
+        projections = compute_multi_period_projections(
+            self.df_synthetic,
+            events=events_input,
+        )
+
+        self.assertTrue(projections["6M"]["events_conditioned"])
+        self.assertEqual(projections["6M"]["pead_drift_regime"], "BULLISH_PEAD")
+        self.assertEqual(projections["6M"]["catalyst_status"], "APPROACHING")
+        self.assertEqual(projections["6M"]["event_haircut"], 0.5)
+
+    def test_run_stock_analysis_with_events(self):
+        """Test full run_stock_analysis pipeline including event risk and PEAD extraction."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            (data_dir / "TEST_EVT.csv").write_text(self.df_synthetic.to_csv(index=False), encoding="utf-8")
+            max_date = self.df_synthetic["date"].max()
+            analysis = run_stock_analysis("TEST_EVT", data_dir, auto_download=False, request_date=max_date)
+
+            self.assertIn("events", analysis)
+            evt = analysis["events"]
+            self.assertIsNotNone(evt)
+            self.assertIn("catalyst_status", evt)
+            self.assertIn("degrossing", evt)
+            self.assertIn("pead", evt)
+            self.assertIn("momentum_events", evt)
+            self.assertIn("catalyst_schedule", evt)
+
+            # Predictive buy analysis and projections should reflect events
+            pred = analysis["predictive"]
+            self.assertIn("catalyst_status", pred)
+            self.assertIn("event_haircut", pred)
+
+            proj = analysis["projections"]
+            self.assertIn("6M", proj)
+            self.assertTrue(proj["6M"]["events_conditioned"])
+
 if __name__ == "__main__":
     unittest.main()
 

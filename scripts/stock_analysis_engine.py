@@ -70,6 +70,29 @@ except Exception:
         VolatilitySurfaceFeatures = None
         compute_dealer_gex_summary = None
 
+try:
+    from qlib.contrib.events import (
+        EventCalendarEngine,
+        PEADEngine,
+        RiskDegrossingEngine,
+        EventsDataLoader,
+        compute_event_risk_features,
+    )
+except Exception:
+    try:
+        from events import (
+            EventCalendarEngine,
+            PEADEngine,
+            RiskDegrossingEngine,
+            EventsDataLoader,
+            compute_event_risk_features,
+        )
+    except Exception:
+        EventCalendarEngine = None
+        PEADEngine = None
+        RiskDegrossingEngine = None
+        EventsDataLoader = None
+        compute_event_risk_features = None
 
 
 # ----------------------------------------------------------------------
@@ -643,25 +666,15 @@ def predict_future_buy_timing(
     regime: Optional[Dict[str, Any]] = None,
     microstructure: Optional[Dict[str, Any]] = None,
     derivatives: Optional[Dict[str, Any]] = None,
+    events: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Perform quantitative and machine-learning predictive analysis on when the stock
     should be bought within the next 3 months (~63 trading days) from the current date,
     conditioned on Bayesian Online Changepoint Detection (BOCD) regime states,
-    institutional microstructure (Anchored VWAP & Volume Profile), and
-    Dealer Gamma Exposure (GEX) option market structure.
-
-    Outputs:
-    - Projected 3-month daily price path (10th percentile bear, 50th median, 90th bull).
-    - BOCD regime state & forward changepoint hazard probabilities.
-    - Dealer Gamma Exposure regime (+GEX stabilizer vs -GEX accelerant).
-    - Call Gamma Wall, Put Gamma Wall, and Gamma Flip levels.
-    - Optimal Entry Price Range (support level / pullback target).
-    - Optimal Buy Window (estimated date range within the next 3 months).
-    - 3-Month Target Price and Expected Upside %.
-    - Stop-Loss Invalidation Price.
-    - Risk/Reward Ratio.
-    - Tactical Recommendation Rating conditioned on market regime and options flow.
+    institutional microstructure (Anchored VWAP & Volume Profile),
+    Dealer Gamma Exposure (GEX) option market structure, and
+    Corporate Catalyst Risk / Post-Earnings Announcement Drift (PEAD).
     """
     df = df.copy().sort_values("date").reset_index(drop=True)
     if len(df) < 50:
@@ -758,6 +771,38 @@ def predict_future_buy_timing(
                 elif gex_regime_state < 0:
                     gex_vol_mult = 1.25
 
+    # 2.7 Parse Corporate Catalyst & Event Risk (PEAD) Parameters
+    event_degross_mult = 1.0
+    next_earnings_date = None
+    earnings_days_away = None
+    earnings_proximity = "SAFE"
+    pead_regime = ""
+    sue_score = 0.0
+    pead_gap_pct = 0.0
+    pead_drift_pct = 0.0
+    pead_drift_score = 0.0
+
+    if events and isinstance(events, dict):
+        cat_info = events.get("catalyst_status") or events.get("catalyst") or {}
+        next_earnings_date = cat_info.get("next_earnings_date") or events.get("next_earnings_date") or cat_info.get("next_event_date")
+        earnings_days_away = cat_info.get("days_to_earnings") if cat_info.get("days_to_earnings") is not None else (
+            cat_info.get("earnings_days_away") if cat_info.get("earnings_days_away") is not None else events.get("earnings_days_away")
+        )
+        earnings_proximity = cat_info.get("status_code") or cat_info.get("earnings_proximity") or events.get("earnings_proximity", "SAFE")
+        
+        degross_info = events.get("degrossing", {})
+        if "position_haircut" in degross_info:
+            event_degross_mult = float(degross_info["position_haircut"])
+        else:
+            event_degross_mult = float(events.get("degross_multiplier", 1.0))
+
+        pead_info = events.get("pead", {})
+        pead_regime = pead_info.get("drift_regime", "")
+        sue_score = float(pead_info.get("sue_score", 0.0))
+        pead_gap_pct = float(pead_info.get("announcement_gap_pct", 0.0))
+        pead_drift_pct = float(pead_info.get("post_earnings_drift_pct", 0.0))
+        pead_drift_score = float(pead_info.get("pead_drift_score", 0.0))
+
     # 3. Generate future business/trading dates
     future_dates = []
     curr = latest_dt
@@ -776,6 +821,9 @@ def predict_future_buy_timing(
     price_paths = np.zeros((simulations, forecast_days))
     price_paths[:, 0] = current_price
 
+    # Monte Carlo simulation paths setup
+    t_earn = future_dates.index(next_earnings_date) if (next_earnings_date and next_earnings_date in future_dates) else -1
+
     for t in range(1, forecast_days):
         z = np.random.standard_normal(simulations)
         # Pull toward 50-day / 200-day trend channel
@@ -791,6 +839,13 @@ def predict_future_buy_timing(
                 jump_direction = -0.5 * daily_vol_clamped if regime_state == 2 else 0.0
                 jump_shocks = np.random.laplace(loc=jump_direction, scale=1.5 * daily_vol_clamped, size=simulations)
                 step_return += jump_occurred * jump_shocks
+
+        # Corporate earnings announcement binary gap jump shock:
+        if t == t_earn:
+            # Concentrated binary gap shock: magnitude ~2.5x daily vol with drift skew from SUE
+            earn_direction = 0.003 * (sue_score if sue_score != 0 else 1.0)
+            earn_gap_shocks = np.random.normal(loc=earn_direction, scale=2.5 * daily_vol_clamped, size=simulations)
+            step_return += earn_gap_shocks
 
         price_paths[:, t] = price_paths[:, t - 1] * (1.0 + step_return)
 
@@ -856,13 +911,23 @@ def predict_future_buy_timing(
             f"Bayesian changepoint alert active ({cp_hazard_pct:.1f}% instant hazard). "
             f"Market structure is in an inflection phase; pause new entries until run-length stabilizes."
         )
-        entry_low = round(min(key_support * 0.96, current_price * 0.93), 2)
-        entry_high = round(min(key_support * 0.99, current_price * 0.96), 2)
+        entry_low = round(key_support * 0.95, 2)
+        entry_high = round(current_price * 0.97, 2)
         opt_window_start = future_dates[min(10, forecast_days - 1)]
         opt_window_end = future_dates[min(25, forecast_days - 1)]
     elif regime_state == 0:
         # Low-Vol Trending Bull
-        if current_rsi > 70 or pct_b > 0.85:
+        if current_price > sma20 and current_rsi > 65:
+            recommendation = "BULLISH MOMENTUM / DIP ACCUMULATION"
+            action_summary = (
+                f"Sustained bullish markup regime (BOCD State 0, run-length {exp_run_length:.0f}d). "
+                f"Trend momentum is strong; accumulate on minor intraday pullbacks."
+            )
+            entry_low = round(max(key_support, current_price * 0.96), 2)
+            entry_high = round(current_price * 0.985, 2)
+            opt_window_start = future_dates[min(3, forecast_days - 1)]
+            opt_window_end = future_dates[min(15, forecast_days - 1)]
+        elif current_rsi > 70 or pct_b > 0.85:
             recommendation = "BUY ON PULLBACK"
             action_summary = (
                 f"Bull trend active (BOCD State 0), but short-term overbought (RSI {current_rsi:.1f}). "
@@ -935,6 +1000,42 @@ def predict_future_buy_timing(
                 f"${put_wall:.2f} and Call Wall ${call_wall:.2f}.]"
             )
 
+    # 6. Incorporate Corporate Catalyst Awareness & PEAD Dynamics
+    if events and isinstance(events, dict):
+        if next_earnings_date and RiskDegrossingEngine is not None:
+            opt_window_start, opt_window_end, was_delayed = RiskDegrossingEngine.adjust_buy_window(
+                opt_window_start,
+                opt_window_end,
+                next_earnings_date,
+                latest_date_str,
+                min_buffer_days=2,
+            )
+            if was_delayed:
+                action_summary += (
+                    f" [Event Timing Adjustment: Buy window delayed to {opt_window_start} "
+                    f"following {next_earnings_date} earnings release.]"
+                )
+
+        if earnings_proximity == "CRITICAL_EVENT" or (earnings_days_away is not None and earnings_days_away <= 1):
+            recommendation = "EVENT RISK / PRE-EARNINGS DE-GROSSING"
+            action_summary = (
+                f"Binary earnings catalyst on {next_earnings_date} ({earnings_days_away or 1} day away). "
+                f"Freeze new entries to avoid overnight gap liquidations; enforce 100% pre-event position de-grossing."
+            )
+        elif earnings_proximity == "IMMINENT_DEGROSS" or (earnings_days_away is not None and earnings_days_away <= 4):
+            if recommendation != "RISK-OFF / CAPITAL PRESERVATION":
+                recommendation = "IMMINENT CATALYST / 50% DE-GROSSING"
+                action_summary = (
+                    f"Corporate earnings scheduled on {next_earnings_date} ({earnings_days_away} days away). "
+                    f"Limit long exposure to 50% capital sizing haircut until event uncertainty passes."
+                )
+        elif "bullish" in pead_regime.lower() and recommendation not in ["RISK-OFF / CAPITAL PRESERVATION", "REGIME SHIFT ALERT / PAUSE ENTRIES"]:
+            recommendation = "PEAD POST-EARNINGS DRIFT ACCUMULATION"
+            action_summary += (
+                f" [PEAD Alert: Active post-earnings bullish drift (SUE {sue_score:+.2f}). "
+                f"Institutional underreaction provides positive drift momentum.]"
+            )
+
     target_price_3m = round(float(p50_median[-1]), 2)
     expected_gain_pct = round(((target_price_3m - current_price) / current_price) * 100.0, 2)
     stop_loss = round(float(min(key_support * 0.96, entry_low * 0.96)), 2)
@@ -989,6 +1090,21 @@ def predict_future_buy_timing(
         "gamma_flip_price": round(float(gamma_flip), 2) if gamma_flip is not None and not pd.isna(gamma_flip) else None,
         "max_pain_price": round(float(max_pain), 2) if max_pain is not None and not pd.isna(max_pain) else None,
         "gex_vol_multiplier": gex_vol_mult,
+        "next_earnings_date": next_earnings_date,
+        "earnings_days_away": earnings_days_away,
+        "earnings_proximity": earnings_proximity,
+        "catalyst_status": earnings_proximity or "SAFE",
+        "event_degross_multiplier": event_degross_mult,
+        "event_haircut": event_degross_mult,
+        "action_recommendation": recommendation,
+        "optimal_buy_window_start": opt_window_start,
+        "optimal_buy_window_end": opt_window_end,
+        "pead_regime": pead_regime,
+        "pead_drift_regime": pead_regime,
+        "pead_sue_score": sue_score,
+        "pead_announcement_gap_pct": pead_gap_pct,
+        "pead_post_earnings_drift_pct": pead_drift_pct,
+        "pead_drift_score": pead_drift_score,
     }
 
 
@@ -1003,6 +1119,7 @@ def compute_multi_period_projections(
     regime: Optional[Dict[str, Any]] = None,
     microstructure: Optional[Dict[str, Any]] = None,
     derivatives: Optional[Dict[str, Any]] = None,
+    events: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Project future returns over multiple investment horizons:
@@ -1017,6 +1134,7 @@ def compute_multi_period_projections(
     - Anchored VWAP (AVWAP) standardized Z-score mean-reversion adjustments
     - Volume Profile liquidity void dispersion expansion
     - Dealer Gamma Exposure (GEX) regime compression vs expansion
+    - Corporate Catalyst / Post-Earnings Announcement Drift (PEAD) momentum & gap dispersion
     - Cumulative forward changepoint hazard probability per horizon
 
     For each horizon, calculates:
@@ -1098,6 +1216,22 @@ def compute_multi_period_projections(
         vp = microstructure.get("volume_profile", {})
         in_liquidity_void = bool(vp.get("in_liquidity_void", False))
 
+    # 3. Parse Corporate Catalyst & PEAD Factors
+    pead_drift_boost = 0.0
+    pead_regime = None
+    event_gap_sd = 0.0
+    catalyst_status_code = None
+    event_haircut = 1.0
+    if events and isinstance(events, dict):
+        pead_dict = events.get("pead", {})
+        pead_drift_boost = float(pead_dict.get("pead_drift_boost", 0.0))
+        pead_regime = pead_dict.get("drift_regime")
+        degross_dict = events.get("degrossing", {})
+        event_gap_sd = float(degross_dict.get("binary_gap_sd", 0.0))
+        event_haircut = float(degross_dict.get("position_haircut", 1.0))
+        cat_dict = events.get("catalyst_status", {})
+        catalyst_status_code = cat_dict.get("status_code", "SAFE")
+
     results = {}
     horizon_labels = {
         "6M": "6 Months",
@@ -1129,6 +1263,11 @@ def compute_multi_period_projections(
                 # Severe structural liquidation breakdown
                 delta_avwap = -0.03 * w_regime
         effective_drift += delta_avwap
+
+        # Corporate Catalyst & PEAD drift boost for near-term horizons
+        if pead_drift_boost != 0.0:
+            effective_drift += pead_drift_boost * w_regime
+
         effective_drift = max(-0.25, min(0.35, effective_drift))
 
         # Effective volatility
@@ -1149,6 +1288,10 @@ def compute_multi_period_projections(
                 horizon_vol *= (1.0 - 0.10 * w_regime)  # +GEX compresses dispersion
             elif gex_state < 0:
                 horizon_vol *= (1.0 + 0.15 * w_regime)  # -GEX expands dispersion
+
+        # Event Binary Gap Risk dispersion expansion for near-term horizons
+        if event_gap_sd > 0.0:
+            horizon_vol += (event_gap_sd * 0.5) * w_regime
 
         ann_vol_clamped = max(0.12, min(0.70, horizon_vol))
 
@@ -1212,7 +1355,11 @@ def compute_multi_period_projections(
             "regime_conditioned": regime is not None,
             "microstructure_conditioned": microstructure is not None,
             "derivatives_conditioned": derivatives is not None,
+            "events_conditioned": events is not None,
             "dealer_gex_regime": derivatives.get("regime") if derivatives else None,
+            "pead_drift_regime": pead_regime,
+            "catalyst_status": catalyst_status_code,
+            "event_haircut": round(event_haircut, 2),
             "bocd_changepoint_prob_pct": cp_prob_horizon,
             "regime_state": regime_state,
             "regime_name": regime_state_name,
@@ -1340,6 +1487,33 @@ def compute_dealer_gex_features(
         logger.warning(f"Dealer Gamma Exposure analysis encountered an exception: {e}")
         return None
 
+
+def compute_event_features(
+    df: pd.DataFrame,
+    symbol: str = "STOCK",
+    data_dir: Optional[Union[str, Path]] = None,
+    current_date: Optional[Union[str, pd.Timestamp]] = None,
+    bocd_changepoints: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Compute corporate catalyst awareness, risk de-grossing factors,
+    PEAD drift dynamics, and key momentum events for main charting.
+    """
+    if compute_event_risk_features is None:
+        return None
+    try:
+        return compute_event_risk_features(
+            df=df,
+            symbol=symbol,
+            data_dir=data_dir,
+            current_date=current_date,
+            bocd_changepoints=bocd_changepoints,
+        )
+    except Exception as e:
+        logger.warning(f"Event risk & PEAD analysis encountered an exception: {e}")
+        return None
+
+
 # ----------------------------------------------------------------------
 # 7. Master Analysis Coordinator
 # ----------------------------------------------------------------------
@@ -1391,6 +1565,36 @@ def run_stock_analysis(
     # 2.5 Institutional Derivatives & Dealer Gamma Exposure (GEX)
     derivatives_summary = compute_dealer_gex_features(df, symbol=symbol, data_dir=data_dir)
 
+    # 2.75 Corporate Catalyst Awareness & PEAD Models
+    bocd_cps = []
+    if regime_summary and "changepoints" in regime_summary:
+        bocd_cps = regime_summary["changepoints"]
+    elif not df.empty and "regime_state" in df.columns and "changepoint_prob" in df.columns:
+        prev_st = None
+        last_idx = -999
+        for i_row, r_data in df.iterrows():
+            st = int(r_data.get("regime_state", 1))
+            prob = float(r_data.get("changepoint_prob", 0.0))
+            if prev_st is not None and st != prev_st and (i_row - last_idx >= 30):
+                st_name = MarketRegimeClassifier.REGIME_NAMES.get(st, f"State {st}") if MarketRegimeClassifier else f"State {st}"
+                bocd_cps.append({
+                    "date": str(r_data["date"])[:10],
+                    "state": st,
+                    "name": st_name,
+                    "description": f"Bayesian regime transition to {st_name} (CP hazard: {prob*100:.0f}%)",
+                    "prob": prob,
+                })
+                last_idx = i_row
+            prev_st = st
+
+    event_summary = compute_event_features(
+        df,
+        symbol=symbol,
+        data_dir=data_dir,
+        current_date=latest_date,
+        bocd_changepoints=bocd_cps,
+    )
+
     # 3. Performance, buy timing, and forward projections
     perf_summary = compute_performance_summary(df, periods_years=[1, 3, 5])
     best_buys = detect_historical_best_buys(df, periods_years=[1, 3, 5])
@@ -1400,12 +1604,14 @@ def run_stock_analysis(
         regime=regime_summary,
         microstructure=micro_summary,
         derivatives=derivatives_summary,
+        events=event_summary,
     )
     projections = compute_multi_period_projections(
         df,
         regime=regime_summary,
         microstructure=micro_summary,
         derivatives=derivatives_summary,
+        events=event_summary,
     )
 
     return {
@@ -1423,4 +1629,5 @@ def run_stock_analysis(
         "regime": regime_summary,
         "microstructure": micro_summary,
         "derivatives": derivatives_summary,
+        "events": event_summary,
     }

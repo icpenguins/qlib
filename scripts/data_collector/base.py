@@ -353,7 +353,6 @@ class Normalize:
 
 
 class BaseRun(abc.ABC):
-    def __init__(self, source_dir=None, normalize_dir=None, max_workers=1, interval="1d"):
     def __init__(self, source_dir=None, normalize_dir=None, max_workers=1, interval="1d", target_dir=None):
         """
 

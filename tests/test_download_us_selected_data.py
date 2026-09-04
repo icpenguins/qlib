@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from download_us_selected_data import (
     DEFAULT_US_SYMBOLS,
+    INDEX_ALIASES,
     parse_symbols,
     load_symbols_from_file,
     normalize_symbol_data,
@@ -49,6 +50,17 @@ class TestDownloadUSSelectedData(unittest.TestCase):
         # List with duplicates and whitespace
         s3 = parse_symbols(["tsla", "NVDA ", "spy", "TSLA", "qqq"])
         self.assertEqual(s3, ["TSLA", "NVDA", "SPY", "QQQ"])
+
+    def test_index_aliases_mapping(self):
+        """Ensure common market indices (SPX, NDX, etc.) resolve to Yahoo compatible symbols."""
+        self.assertIn("SPX", INDEX_ALIASES)
+        self.assertEqual(INDEX_ALIASES["SPX"], "^GSPC")
+        self.assertIn("NDX", INDEX_ALIASES)
+        self.assertEqual(INDEX_ALIASES["NDX"], "^NDX")
+        self.assertIn("RUT", INDEX_ALIASES)
+        self.assertEqual(INDEX_ALIASES["RUT"], "^RUT")
+        self.assertIn("VIX", INDEX_ALIASES)
+        self.assertEqual(INDEX_ALIASES["VIX"], "^VIX")
 
     def test_normalize_symbol_data(self):
         """Test Qlib 1D price normalization logic."""
