@@ -1114,6 +1114,11 @@ def generate_html_dashboard(
             </button>
           </div>
 
+          <!-- Best Buy Price Toggle Button -->
+          <button id="btn-toggle-best-buys" onclick="toggleBestBuysDisplay()" title="Toggle Historical Best Buy Entry Points, Guideline Markers & Profit Corridors" class="px-2.5 py-1 rounded font-medium text-amber-400 bg-amber-950/50 border border-amber-700/60 hover:text-white hover:bg-amber-900 transition flex items-center gap-1.5 text-xs">
+            <span>★</span> <span id="lbl-toggle-best-buys">Best Buys: ON</span>
+          </button>
+
           <!-- Momentum Events Toggle Button -->
           <button id="btn-toggle-events" onclick="toggleEventsDisplay()" title="Toggle Key Momentum Events (Earnings Beats/Misses, BOCD Shifts, FOMC Pivots)" class="px-2.5 py-1 rounded font-medium text-emerald-400 bg-emerald-950/50 border border-emerald-700/60 hover:text-white hover:bg-emerald-900 transition flex items-center gap-1.5 text-xs">
             <span>⚡</span> <span id="lbl-toggle-events">Key Events: ON</span>
@@ -1159,7 +1164,7 @@ def generate_html_dashboard(
           <span class="flex items-center gap-1.5"><span class="text-amber-400 text-xs font-bold">⚡</span> BOCD Shift</span>
           <span class="flex items-center gap-1.5"><span class="text-cyan-400 text-xs font-bold">◆</span> FOMC</span>
         </div>
-        <div>Drag across chart or scroll wheel to zoom &bull; Toggle key events above.</div>
+        <div>Drag across chart or scroll wheel to zoom &bull; Toggle Best Buys or Key Events above.</div>
       </div>
 
       <!-- DEDICATED TIMELINE CHART OVERLAY -->
@@ -1306,8 +1311,25 @@ def generate_html_dashboard(
     let currentPeriod = '5Y';
     let filteredHistory = [];
     let currentBestBuys = [];
+    let showBestBuys = true;
     let showMomentumEvents = true;
     let activeChartEventPins = [];
+
+    function toggleBestBuysDisplay() {{
+      showBestBuys = !showBestBuys;
+      const btn = document.getElementById('btn-toggle-best-buys');
+      const lbl = document.getElementById('lbl-toggle-best-buys');
+      if (btn && lbl) {{
+        if (showBestBuys) {{
+          btn.className = 'px-2.5 py-1 rounded font-medium text-amber-400 bg-amber-950/50 border border-amber-700/60 hover:text-white hover:bg-amber-900 transition flex items-center gap-1.5 text-xs';
+          lbl.textContent = 'Best Buys: ON';
+        }} else {{
+          btn.className = 'px-2.5 py-1 rounded font-medium text-gray-400 bg-gray-800/60 border border-gray-700 hover:text-white hover:bg-gray-700 transition flex items-center gap-1.5 text-xs';
+          lbl.textContent = 'Best Buys: OFF';
+        }}
+      }}
+      renderHistoricalChart();
+    }}
 
     function toggleEventsDisplay() {{
       showMomentumEvents = !showMomentumEvents;
@@ -1673,30 +1695,32 @@ def generate_html_dashboard(
       }}
 
       // 1. Shaded Profit Rally Corridors (from Buy Date to Subsequent Peak Date)
-      currentBestBuys.forEach(b => {{
-        const bIdx = filteredHistory.findIndex(d => d.date === b.date);
-        const pIdx = filteredHistory.findIndex(d => d.date === b.peak_date);
-        if (bIdx >= 0 && pIdx > bIdx) {{
-          const x1 = getX(bIdx);
-          const x2 = getX(pIdx);
-          const w = x2 - x1;
+      if (showBestBuys) {{
+        currentBestBuys.forEach(b => {{
+          const bIdx = filteredHistory.findIndex(d => d.date === b.date);
+          const pIdx = filteredHistory.findIndex(d => d.date === b.peak_date);
+          if (bIdx >= 0 && pIdx > bIdx) {{
+            const x1 = getX(bIdx);
+            const x2 = getX(pIdx);
+            const w = x2 - x1;
 
-          const isHl = (highlightedDate === b.date);
-          const gradRally = ctx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
-          gradRally.addColorStop(0, isHl ? 'rgba(16, 185, 129, 0.35)' : 'rgba(16, 185, 129, 0.18)');
-          gradRally.addColorStop(1, isHl ? 'rgba(16, 185, 129, 0.08)' : 'rgba(16, 185, 129, 0.02)');
+            const isHl = (highlightedDate === b.date);
+            const gradRally = ctx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+            gradRally.addColorStop(0, isHl ? 'rgba(16, 185, 129, 0.35)' : 'rgba(16, 185, 129, 0.18)');
+            gradRally.addColorStop(1, isHl ? 'rgba(16, 185, 129, 0.08)' : 'rgba(16, 185, 129, 0.02)');
 
-          ctx.fillStyle = gradRally;
-          ctx.fillRect(x1, padding.top, w, plotHeight);
+            ctx.fillStyle = gradRally;
+            ctx.fillRect(x1, padding.top, w, plotHeight);
 
-          // Top and border dashed lines
-          ctx.strokeStyle = isHl ? 'rgba(16, 185, 129, 0.8)' : 'rgba(16, 185, 129, 0.4)';
-          ctx.lineWidth = isHl ? 1.5 : 1;
-          ctx.setLineDash([3, 3]);
-          ctx.strokeRect(x1, padding.top, w, plotHeight);
-          ctx.setLineDash([]);
-        }}
-      }});
+            // Top and border dashed lines
+            ctx.strokeStyle = isHl ? 'rgba(16, 185, 129, 0.8)' : 'rgba(16, 185, 129, 0.4)';
+            ctx.lineWidth = isHl ? 1.5 : 1;
+            ctx.setLineDash([3, 3]);
+            ctx.strokeRect(x1, padding.top, w, plotHeight);
+            ctx.setLineDash([]);
+          }}
+        }});
+      }}
 
       // Draw 200 SMA
       ctx.strokeStyle = '#c084fc';
@@ -1788,76 +1812,78 @@ def generate_html_dashboard(
       ctx.stroke();
 
       // Highlight Historical Best Buy Points, Vertical Guidelines, and Overlay Callout Badges
-      currentBestBuys.forEach((b, i) => {{
-        const idx = filteredHistory.findIndex(d => d.date === b.date);
-        if (idx >= 0) {{
-          const x = getX(idx);
-          const y = getY(b.price);
-          const isHl = (highlightedDate === b.date);
+      if (showBestBuys) {{
+        currentBestBuys.forEach((b, i) => {{
+          const idx = filteredHistory.findIndex(d => d.date === b.date);
+          if (idx >= 0) {{
+            const x = getX(idx);
+            const y = getY(b.price);
+            const isHl = (highlightedDate === b.date);
 
-          // Vertical timeline guideline
-          ctx.strokeStyle = isHl ? 'rgba(245, 158, 11, 0.9)' : 'rgba(245, 158, 11, 0.45)';
-          ctx.lineWidth = isHl ? 1.8 : 1.2;
-          ctx.setLineDash([3, 3]);
-          ctx.beginPath();
-          ctx.moveTo(x, padding.top);
-          ctx.lineTo(x, height - padding.bottom);
-          ctx.stroke();
-          ctx.setLineDash([]);
+            // Vertical timeline guideline
+            ctx.strokeStyle = isHl ? 'rgba(245, 158, 11, 0.9)' : 'rgba(245, 158, 11, 0.45)';
+            ctx.lineWidth = isHl ? 1.8 : 1.2;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(x, padding.top);
+            ctx.lineTo(x, height - padding.bottom);
+            ctx.stroke();
+            ctx.setLineDash([]);
 
-          // Outer Glow
-          ctx.fillStyle = isHl ? 'rgba(245, 158, 11, 0.6)' : 'rgba(245, 158, 11, 0.35)';
-          ctx.beginPath();
-          ctx.arc(x, y, isHl ? 14 : 10, 0, Math.PI * 2);
-          ctx.fill();
+            // Outer Glow
+            ctx.fillStyle = isHl ? 'rgba(245, 158, 11, 0.6)' : 'rgba(245, 158, 11, 0.35)';
+            ctx.beginPath();
+            ctx.arc(x, y, isHl ? 14 : 10, 0, Math.PI * 2);
+            ctx.fill();
 
-          // Star / Core Dot
-          ctx.fillStyle = '#f59e0b';
-          ctx.beginPath();
-          ctx.arc(x, y, 5, 0, Math.PI * 2);
-          ctx.fill();
+            // Star / Core Dot
+            ctx.fillStyle = '#f59e0b';
+            ctx.beginPath();
+            ctx.arc(x, y, 5, 0, Math.PI * 2);
+            ctx.fill();
 
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 1.5;
-          ctx.stroke();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
 
-          // Overlay Callout Flag Badge
-          const tagText = `★ Buy $${{b.price.toFixed(0)}} (+${{b.max_gain_pct.toFixed(0)}}%)`;
-          ctx.font = 'bold 9px monospace';
-          const tagW = ctx.measureText(tagText).width + 12;
-          const tagH = 17;
-          // Stagger badges vertically so they don't collide
-          const yOffset = (i % 2 === 0) ? 26 : 46;
-          const tagY = Math.max(padding.top + 2, y - yOffset);
-          const tagX = Math.min(width - padding.right - tagW - 2, Math.max(padding.left + 2, x - tagW / 2));
+            // Overlay Callout Flag Badge
+            const tagText = `★ Buy $${{b.price.toFixed(0)}} (+${{b.max_gain_pct.toFixed(0)}}%)`;
+            ctx.font = 'bold 9px monospace';
+            const tagW = ctx.measureText(tagText).width + 12;
+            const tagH = 17;
+            // Stagger badges vertically so they don't collide
+            const yOffset = (i % 2 === 0) ? 26 : 46;
+            const tagY = Math.max(padding.top + 2, y - yOffset);
+            const tagX = Math.min(width - padding.right - tagW - 2, Math.max(padding.left + 2, x - tagW / 2));
 
-          // Pin stem
-          ctx.strokeStyle = isHl ? '#f59e0b' : '#d97706';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(x, tagY + tagH);
-          ctx.lineTo(x, y - 6);
-          ctx.stroke();
+            // Pin stem
+            ctx.strokeStyle = isHl ? '#f59e0b' : '#d97706';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(x, tagY + tagH);
+            ctx.lineTo(x, y - 6);
+            ctx.stroke();
 
-          // Badge background
-          ctx.fillStyle = isHl ? '#312e81' : '#1e1b4b';
-          ctx.strokeStyle = isHl ? '#fbbf24' : '#f59e0b';
-          ctx.lineWidth = isHl ? 1.5 : 1;
-          ctx.beginPath();
-          if (ctx.roundRect) {{
-            ctx.roundRect(tagX, tagY, tagW, tagH, 4);
-          }} else {{
-            ctx.rect(tagX, tagY, tagW, tagH);
+            // Badge background
+            ctx.fillStyle = isHl ? '#312e81' : '#1e1b4b';
+            ctx.strokeStyle = isHl ? '#fbbf24' : '#f59e0b';
+            ctx.lineWidth = isHl ? 1.5 : 1;
+            ctx.beginPath();
+            if (ctx.roundRect) {{
+              ctx.roundRect(tagX, tagY, tagW, tagH, 4);
+            }} else {{
+              ctx.rect(tagX, tagY, tagW, tagH);
+            }}
+            ctx.fill();
+            ctx.stroke();
+
+            // Badge text
+            ctx.fillStyle = isHl ? '#ffffff' : '#fef08a';
+            ctx.textAlign = 'center';
+            ctx.fillText(tagText, tagX + tagW / 2, tagY + 11);
           }}
-          ctx.fill();
-          ctx.stroke();
-
-          // Badge text
-          ctx.fillStyle = isHl ? '#ffffff' : '#fef08a';
-          ctx.textAlign = 'center';
-          ctx.fillText(tagText, tagX + tagW / 2, tagY + 11);
-        }}
-      }});
+        }});
+      }}
 
       // Render Key Momentum-Shifting Events (Interactive Pins on Main Chart)
       if (showMomentumEvents && MOMENTUM_EVENTS && MOMENTUM_EVENTS.length > 0) {{
@@ -2058,7 +2084,7 @@ def generate_html_dashboard(
       const d = filteredHistory[idx];
 
       // Check if near any Best Buy point
-      const nearBuy = currentBestBuys.find(b => b.date === d.date);
+      const nearBuy = showBestBuys ? currentBestBuys.find(b => b.date === d.date) : null;
 
       // Check if mouse is hovering over or near any Key Momentum Event Pin
       let nearEventPin = null;
