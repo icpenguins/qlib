@@ -49,6 +49,28 @@ except Exception:
     except Exception:
         compute_microstructure_features = None
 
+try:
+    from qlib.contrib.derivatives import (
+        DealerGammaEngine,
+        OptionsDataLoader,
+        VolatilitySurfaceFeatures,
+        compute_dealer_gex_summary,
+    )
+except Exception:
+    try:
+        from derivatives import (
+            DealerGammaEngine,
+            OptionsDataLoader,
+            VolatilitySurfaceFeatures,
+            compute_dealer_gex_summary,
+        )
+    except Exception:
+        DealerGammaEngine = None
+        OptionsDataLoader = None
+        VolatilitySurfaceFeatures = None
+        compute_dealer_gex_summary = None
+
+
 
 # ----------------------------------------------------------------------
 # 1. Data Ingestion Layer (Qlib Binary + CSV Discovery & Freshness)
@@ -620,22 +642,26 @@ def predict_future_buy_timing(
     simulations: int = 1000,
     regime: Optional[Dict[str, Any]] = None,
     microstructure: Optional[Dict[str, Any]] = None,
+    derivatives: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Perform quantitative and machine-learning predictive analysis on when the stock
     should be bought within the next 3 months (~63 trading days) from the current date,
-    conditioned on Bayesian Online Changepoint Detection (BOCD) regime states and
-    institutional microstructure (Anchored VWAP & Volume Profile).
+    conditioned on Bayesian Online Changepoint Detection (BOCD) regime states,
+    institutional microstructure (Anchored VWAP & Volume Profile), and
+    Dealer Gamma Exposure (GEX) option market structure.
 
     Outputs:
     - Projected 3-month daily price path (10th percentile bear, 50th median, 90th bull).
     - BOCD regime state & forward changepoint hazard probabilities.
+    - Dealer Gamma Exposure regime (+GEX stabilizer vs -GEX accelerant).
+    - Call Gamma Wall, Put Gamma Wall, and Gamma Flip levels.
     - Optimal Entry Price Range (support level / pullback target).
     - Optimal Buy Window (estimated date range within the next 3 months).
     - 3-Month Target Price and Expected Upside %.
     - Stop-Loss Invalidation Price.
     - Risk/Reward Ratio.
-    - Tactical Recommendation Rating conditioned on market regime.
+    - Tactical Recommendation Rating conditioned on market regime and options flow.
     """
     df = df.copy().sort_values("date").reset_index(drop=True)
     if len(df) < 50:
@@ -697,6 +723,41 @@ def predict_future_buy_timing(
     else:
         h_daily = 0.0
 
+    # 2.5 Parse Dealer Gamma Exposure (GEX) Parameters
+    gex_regime_state = 0
+    gex_vol_mult = 1.0
+    call_wall = None
+    put_wall = None
+    gamma_flip = None
+    max_pain = None
+    net_gex_m = 0.0
+    gex_regime_desc = None
+
+    if derivatives and isinstance(derivatives, dict):
+        gex_data = derivatives.get("gex", derivatives)
+        if isinstance(gex_data, dict):
+            net_gex_m = float(gex_data.get("net_gex_millions", gex_data.get("net_gex_dollar_per_1pct", 0.0) / 1e6))
+            gex_regime_desc = gex_data.get("regime", "")
+            call_wall = gex_data.get("call_wall", gex_data.get("call_wall_strike"))
+            put_wall = gex_data.get("put_wall", gex_data.get("put_wall_strike"))
+            gamma_flip = gex_data.get("gamma_flip_price")
+            max_pain = gex_data.get("max_pain", gex_data.get("max_pain_strike"))
+
+            # In +GEX (dealers long gamma), dealers counter-trade, suppressing volatility (0.85x)
+            # In -GEX (dealers short gamma), dealers pro-cyclically hedge, amplifying volatility (1.25x)
+            if "+GEX" in gex_regime_desc or net_gex_m > 0:
+                gex_regime_state = 1
+                gex_vol_mult = 0.85
+            elif "-GEX" in gex_regime_desc or net_gex_m < 0:
+                gex_regime_state = -1
+                gex_vol_mult = 1.25
+            else:
+                gex_regime_state = gex_data.get("regime_state", 0)
+                if gex_regime_state > 0:
+                    gex_vol_mult = 0.85
+                elif gex_regime_state < 0:
+                    gex_vol_mult = 1.25
+
     # 3. Generate future business/trading dates
     future_dates = []
     curr = latest_dt
@@ -708,7 +769,7 @@ def predict_future_buy_timing(
     # 4. Monte Carlo & Trend Decomposition Simulation
     # Geometric Brownian Motion with Mean-Reversion Component + BOCD Regime Jump Shocks
     np.random.seed(42)
-    daily_vol_clamped = max(0.005, min(0.045, daily_vol))
+    daily_vol_clamped = max(0.005, min(0.045, daily_vol * gex_vol_mult))
     # Drift conditioned on regime risk multiplier
     adj_drift = max(-0.0015, min(0.0015, drift * risk_mult))
 
@@ -765,6 +826,15 @@ def predict_future_buy_timing(
             key_support = max(key_support, float(val))
         if vah and not pd.isna(vah) and vah > current_price:
             resistance = max(resistance, float(vah))
+
+    # Incorporate Institutional Dealer Gamma Exposure (GEX) Walls
+    if derivatives and isinstance(derivatives, dict):
+        if put_wall and not pd.isna(put_wall) and put_wall < current_price:
+            key_support = max(key_support, float(put_wall))
+        if max_pain and not pd.isna(max_pain) and max_pain < current_price * 0.98:
+            key_support = max(key_support, float(max_pain))
+        if call_wall and not pd.isna(call_wall) and call_wall > current_price:
+            resistance = max(resistance, float(call_wall))
 
     # Check regime state first, then fallback to technical RSI/Bollinger Bands
     if regime_state == 2:
@@ -852,6 +922,19 @@ def predict_future_buy_timing(
             opt_window_start = future_dates[5]
             opt_window_end = future_dates[min(25, forecast_days - 1)]
 
+    # Incorporate Dealer Gamma Exposure into tactical action summary
+    if derivatives and isinstance(derivatives, dict):
+        if gex_regime_state < 0 and gamma_flip is not None:
+            action_summary += (
+                f" [GEX Alert: -GEX regime active ({net_gex_m:+.1f}M/1%). Dealer dynamic hedging accelerates drops below "
+                f"Gamma Flip ${gamma_flip:.2f}; enforce strict stop-loss rules.]"
+            )
+        elif gex_regime_state > 0 and put_wall is not None and call_wall is not None:
+            action_summary += (
+                f" [GEX Note: +GEX regime active (+${net_gex_m:.1f}M/1%). Dealer counter-trading pins price between Put Wall "
+                f"${put_wall:.2f} and Call Wall ${call_wall:.2f}.]"
+            )
+
     target_price_3m = round(float(p50_median[-1]), 2)
     expected_gain_pct = round(((target_price_3m - current_price) / current_price) * 100.0, 2)
     stop_loss = round(float(min(key_support * 0.96, entry_low * 0.96)), 2)
@@ -896,7 +979,18 @@ def predict_future_buy_timing(
         "bocd_changepoint_hazard_pct": cp_hazard_pct,
         "bocd_forward_changepoint_prob_pct": round(forward_cp_prob, 1) if forward_cp_prob is not None else None,
         "bocd_expected_run_length_days": round(exp_run_length, 1) if regime else None,
+        "dealer_gex_regime": gex_regime_desc,
+        "gex_regime": gex_regime_desc,
+        "dealer_net_gex_m": net_gex_m,
+        "call_gamma_wall": round(float(call_wall), 2) if call_wall is not None and not pd.isna(call_wall) else None,
+        "call_wall_price": round(float(call_wall), 2) if call_wall is not None and not pd.isna(call_wall) else None,
+        "put_gamma_wall": round(float(put_wall), 2) if put_wall is not None and not pd.isna(put_wall) else None,
+        "put_wall_price": round(float(put_wall), 2) if put_wall is not None and not pd.isna(put_wall) else None,
+        "gamma_flip_price": round(float(gamma_flip), 2) if gamma_flip is not None and not pd.isna(gamma_flip) else None,
+        "max_pain_price": round(float(max_pain), 2) if max_pain is not None and not pd.isna(max_pain) else None,
+        "gex_vol_multiplier": gex_vol_mult,
     }
+
 
 
 # ----------------------------------------------------------------------
@@ -908,6 +1002,7 @@ def compute_multi_period_projections(
     horizons: Optional[Dict[str, int]] = None,
     regime: Optional[Dict[str, Any]] = None,
     microstructure: Optional[Dict[str, Any]] = None,
+    derivatives: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Project future returns over multiple investment horizons:
@@ -921,6 +1016,7 @@ def compute_multi_period_projections(
     - Multi-horizon realized volatility surfaces (21d vol vs 5d inversion)
     - Anchored VWAP (AVWAP) standardized Z-score mean-reversion adjustments
     - Volume Profile liquidity void dispersion expansion
+    - Dealer Gamma Exposure (GEX) regime compression vs expansion
     - Cumulative forward changepoint hazard probability per horizon
 
     For each horizon, calculates:
@@ -1046,6 +1142,14 @@ def compute_multi_period_projections(
         if in_liquidity_void:
             horizon_vol *= (1.0 + 0.15 * w_regime)  # Thin market depth expands dispersion
 
+        # GEX Volatility Conditioning for Near-Term Horizons
+        if derivatives and isinstance(derivatives, dict):
+            gex_state = derivatives.get("regime_state", 0)
+            if gex_state > 0:
+                horizon_vol *= (1.0 - 0.10 * w_regime)  # +GEX compresses dispersion
+            elif gex_state < 0:
+                horizon_vol *= (1.0 + 0.15 * w_regime)  # -GEX expands dispersion
+
         ann_vol_clamped = max(0.12, min(0.70, horizon_vol))
 
         # Geometric Brownian Motion log-normal parameters
@@ -1107,12 +1211,15 @@ def compute_multi_period_projections(
             "effective_vol_pct": round(ann_vol_clamped * 100.0, 1),
             "regime_conditioned": regime is not None,
             "microstructure_conditioned": microstructure is not None,
+            "derivatives_conditioned": derivatives is not None,
+            "dealer_gex_regime": derivatives.get("regime") if derivatives else None,
             "bocd_changepoint_prob_pct": cp_prob_horizon,
             "regime_state": regime_state,
             "regime_name": regime_state_name,
         }
 
     return results
+
 
 
 # ----------------------------------------------------------------------
@@ -1170,6 +1277,68 @@ def detect_market_regime(
         logger.warning(f"Market regime analysis encountered an exception: {e}")
         return None, df
 
+# ----------------------------------------------------------------------
+# 6.5 Institutional Derivatives & Dealer Gamma Exposure (GEX)
+# ----------------------------------------------------------------------
+
+def compute_dealer_gex_features(
+    df: pd.DataFrame,
+    symbol: str,
+    data_dir: Optional[Union[str, Path]] = None,
+    r: float = 0.045,
+) -> Optional[Dict[str, Any]]:
+    """
+    Compute institutional Dealer Gamma Exposure (GEX), Gamma Flip level,
+    Put/Call Gamma Walls, and options volatility surface metrics for the symbol.
+    """
+    if OptionsDataLoader is None or df.empty or "close" not in df.columns:
+        return None
+
+    try:
+        spot = float(df["close"].iloc[-1])
+        log_ret = np.log(df["close"] / df["close"].shift(1))
+        realized_vol_21d = float(log_ret.tail(21).std() * np.sqrt(252))
+        if np.isnan(realized_vol_21d) or realized_vol_21d < 0.05:
+            realized_vol_21d = 0.25
+
+        loader = OptionsDataLoader(data_dir=data_dir)
+        options_df = loader.load_or_generate_chain(
+            symbol=symbol,
+            spot=spot,
+            realized_vol_21d=realized_vol_21d,
+            r=r,
+        )
+        if options_df is None or options_df.empty:
+            return None
+
+        # GEX calculation
+        gex_summary = compute_dealer_gex_summary(
+            options_df=options_df,
+            spot=spot,
+            r=r,
+            symbol=symbol,
+        )
+
+        # Volatility surface metrics
+        vol_surface = VolatilitySurfaceFeatures.compute_surface_metrics(
+            options_df=options_df,
+            spot=spot,
+            realized_vol_21d=realized_vol_21d,
+            r=r,
+        )
+
+        # Merge results into unified derivatives dict
+        gex_summary["vol_surface"] = vol_surface
+        gex_summary["atm_iv_pct"] = vol_surface.get("atm_iv_pct", 25.0)
+        gex_summary["vrp_pct"] = vol_surface.get("vrp_pct", 0.0)
+        gex_summary["rr25_skew"] = vol_surface.get("rr25_skew", -2.0)
+        gex_summary["skew_regime"] = vol_surface.get("skew_regime", "Normal Equity Skew")
+        gex_summary["realized_vol_21d_pct"] = round(realized_vol_21d * 100.0, 2)
+        gex_summary["gex"] = dict(gex_summary)
+        return gex_summary
+    except Exception as e:
+        logger.warning(f"Dealer Gamma Exposure analysis encountered an exception: {e}")
+        return None
 
 # ----------------------------------------------------------------------
 # 7. Master Analysis Coordinator
@@ -1186,7 +1355,8 @@ def run_stock_analysis(
     """
     Execute full historical performance, optimal entry detection,
     3-month forward predictive analysis, multi-period return projections,
-    and Bayesian Online Changepoint Detection (BOCD) market regime classification.
+    Bayesian Online Changepoint Detection (BOCD) market regime classification,
+    and Institutional Dealer Gamma Exposure (GEX) derivatives analysis.
     Ensures that market data is up-to-date for the requested date before analyzing.
     """
     if request_date is None:
@@ -1218,6 +1388,9 @@ def run_stock_analysis(
         except Exception as e:
             logger.warning(f"Microstructure analysis encountered an exception: {e}")
 
+    # 2.5 Institutional Derivatives & Dealer Gamma Exposure (GEX)
+    derivatives_summary = compute_dealer_gex_features(df, symbol=symbol, data_dir=data_dir)
+
     # 3. Performance, buy timing, and forward projections
     perf_summary = compute_performance_summary(df, periods_years=[1, 3, 5])
     best_buys = detect_historical_best_buys(df, periods_years=[1, 3, 5])
@@ -1226,11 +1399,13 @@ def run_stock_analysis(
         forecast_days=forecast_days,
         regime=regime_summary,
         microstructure=micro_summary,
+        derivatives=derivatives_summary,
     )
     projections = compute_multi_period_projections(
         df,
         regime=regime_summary,
         microstructure=micro_summary,
+        derivatives=derivatives_summary,
     )
 
     return {
@@ -1247,5 +1422,5 @@ def run_stock_analysis(
         "projections": projections,
         "regime": regime_summary,
         "microstructure": micro_summary,
+        "derivatives": derivatives_summary,
     }
-

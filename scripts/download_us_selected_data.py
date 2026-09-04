@@ -653,6 +653,7 @@ def run_pipeline(
     qlib_dir: Optional[Union[str, Path]] = None,
     dump_qlib: bool = True,
     delay: float = 0.5,
+    download_options: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     """
     Execute the full end-to-end data acquisition and processing pipeline.
@@ -755,6 +756,28 @@ def run_pipeline(
         dump_to_qlib_format(results, qlib_dir=qlib_path, freq="day" if interval == "1d" else "1min")
         logger.info(f"Qlib binary dump completed successfully at: {qlib_path}")
 
+    # Download equity option chains if requested
+    if download_options:
+        logger.info("Downloading equity option chains for targeted tickers...")
+        options_dir = (target_path / "options") if target_dir is not None else (source_path.parent / "options")
+        options_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            # Ensure repository path is accessible
+            repo_root = Path(__file__).resolve().parent.parent
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            from qlib.contrib.derivatives.options_data import OptionsDataLoader
+
+            opt_loader = OptionsDataLoader(data_dir=options_dir.parent)
+            for sym in cleaned_symbols:
+                try:
+                    logger.info(f"Downloading option chain for {sym} to {options_dir}...")
+                    opt_loader.download_and_cache(sym, target_dir=options_dir)
+                except Exception as e:
+                    logger.warning(f"Failed downloading option chain for {sym}: {e}")
+        except Exception as e:
+            logger.warning(f"Error during option chain acquisition: {e}")
+
     # Print summary table
     print("\n" + "=" * 80)
     print(f"{'DOWNLOAD & NORMALIZATION SUMMARY':^80}")
@@ -853,6 +876,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Delay in seconds between ticker downloads to avoid rate limits.",
     )
+    parser.add_argument(
+        "--download_options",
+        action="store_true",
+        default=False,
+        help="Download and cache equity option chains for targeted tickers into <target_dir>/options.",
+    )
     return parser
 
 
@@ -882,6 +911,7 @@ def main():
         qlib_dir=args.qlib_dir,
         dump_qlib=args.dump_qlib,
         delay=args.delay,
+        download_options=args.download_options,
     )
 
 
