@@ -53,3 +53,5 @@ tags
 .aider*
 
 reports/
+.venv/
+tests/test_all_flow_mlruns/
