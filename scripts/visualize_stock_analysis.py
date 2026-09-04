@@ -18,6 +18,7 @@ import webbrowser
 from pathlib import Path
 from typing import Dict, Any, Union, Optional
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("VisualizeStockAnalysis")
@@ -32,7 +33,15 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from stock_analysis_engine import run_stock_analysis, compute_multi_period_projections
+from stock_analysis_engine import run_stock_analysis
+from stock_analysis_data import (
+    resolve_json_path,
+    _sanitize_for_json,
+    prepare_analysis_json_payload,
+    export_analysis_json,
+    load_analysis_json,
+    generate_stock_analysis_data,
+)
 
 
 def resolve_report_path(
@@ -45,6 +54,7 @@ def resolve_report_path(
     Resolve the final HTML report file path with the request date.
     - If output is specified:
         - If it has an .html suffix, use as the exact output file path.
+        - If it has a .json suffix, replace suffix with .html.
         - Otherwise, treat output as the target report directory and include the request date.
     - If report_dir is specified (or defaults to 'reports'), use <report_dir>/<SYMBOL>_analysis_report_<DATE>.html.
     - Missing directories are automatically created.
@@ -64,6 +74,9 @@ def resolve_report_path(
         if out_p.suffix.lower() == ".html":
             out_p.parent.mkdir(parents=True, exist_ok=True)
             return out_p
+        elif out_p.suffix.lower() == ".json":
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            return out_p.with_suffix(".html")
         else:
             out_p.mkdir(parents=True, exist_ok=True)
             return out_p / filename
@@ -73,74 +86,13 @@ def resolve_report_path(
     return target_dir / filename
 
 
-def generate_html_dashboard(
-    analysis_data: Dict[str, Any],
-    output_path: Union[str, Path],
-) -> Path:
+
+def build_projection_cards_html(projections: Dict[str, Any]) -> str:
     """
-    Generate an interactive, zero-dependency, self-contained HTML dashboard.
+    Construct modular HTML cards for multi-period forward projections (6M, 1Y, 2Y, 3Y).
     """
-    output_file = Path(output_path).expanduser().resolve()
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-    symbol = analysis_data["symbol"]
-    perf = analysis_data["performance"]
-    best_buys = analysis_data["best_buys"]
-    pred = analysis_data["predictive"]
-    df = analysis_data["historical_data"].copy()
-    req_date = analysis_data.get("request_date", perf.get("latest_date", ""))
-    is_up_to_date = analysis_data.get("is_up_to_date", True)
-
-    # Pre-calculate 50-day and 200-day moving averages across the ENTIRE historical dataset
-    # so moving averages are always continuously available regardless of year selected or zoom level
-    if "close" in df.columns:
-        df["sma50"] = df["close"].rolling(window=50, min_periods=50).mean()
-        df["sma200"] = df["close"].rolling(window=200, min_periods=200).mean()
-    else:
-        df["sma50"] = None
-        df["sma200"] = None
-
-    # Prepare JSON serializable payload for the interactive client-side charts
-    history_payload = []
-    for _, row in df.iterrows():
-        history_payload.append({
-            "date": row["date"],
-            "open": round(float(row["open"]), 2),
-            "high": round(float(row["high"]), 2),
-            "low": round(float(row["low"]), 2),
-            "close": round(float(row["close"]), 2),
-            "volume": int(row["volume"]) if not pd.isna(row["volume"]) else 0,
-            "sma50": round(float(row["sma50"]), 2) if not pd.isna(row.get("sma50")) else None,
-            "sma200": round(float(row["sma200"]), 2) if not pd.isna(row.get("sma200")) else None,
-            "avwap_ytd": round(float(row["avwap_ytd"]), 2) if "avwap_ytd" in row and not pd.isna(row["avwap_ytd"]) else None,
-            "avwap_ytd_upper_1s": round(float(row["avwap_ytd_upper_1s"]), 2) if "avwap_ytd_upper_1s" in row and not pd.isna(row["avwap_ytd_upper_1s"]) else None,
-            "avwap_ytd_lower_1s": round(float(row["avwap_ytd_lower_1s"]), 2) if "avwap_ytd_lower_1s" in row and not pd.isna(row["avwap_ytd_lower_1s"]) else None,
-        })
-
-    # Color palette based on recommendation
-    rec_colors = {
-        "STRONG BUY": ("#10b981", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"),
-        "STRONG BUY / TREND ACCUMULATION": ("#10b981", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"),
-        "BUY ON PULLBACK": ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"),
-        "ACCUMULATE / DIP BUY": ("#06b6d4", "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"),
-        "RANGE ACCUMULATION / BUY SUPPORT": ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"),
-        "HOLD / CAUTIOUS BUY": ("#f59e0b", "bg-amber-500/10 text-amber-400 border-amber-500/30"),
-        "REGIME SHIFT ALERT / PAUSE ENTRIES": ("#f59e0b", "bg-amber-500/10 text-amber-400 border-amber-500/30"),
-        "RISK-OFF / CAPITAL PRESERVATION": ("#ef4444", "bg-red-500/10 text-red-400 border-red-500/30"),
-    }
-    rec_color, rec_badge_class = rec_colors.get(pred["recommendation"], ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"))
-
-    # Multi-period forward projections (6M, 1Y, 2Y, 3Y)
-    projections = analysis_data.get("projections")
     if not projections:
-        projections = compute_multi_period_projections(
-            df,
-            regime=analysis_data.get("regime"),
-            microstructure=analysis_data.get("microstructure"),
-            derivatives=analysis_data.get("derivatives"),
-        )
-
-    # Build projection cards HTML for 6M, 1Y, 2Y, 3Y
+        return ""
     proj_cards_html = ""
     for p_key in ["6M", "1Y", "2Y", "3Y"]:
         p_data = projections.get(p_key, {})
@@ -168,6 +120,21 @@ def generate_html_dashboard(
             badge_class = "bg-red-500/10 text-red-400 border-red-500/30"
             conf_text_color = "text-red-400"
             bar_gradient = "from-red-500 to-rose-400"
+
+        shift_risk_div = ""
+        if p_data.get("bocd_changepoint_prob_pct") is not None:
+            shift_risk_div = f"""<div class="flex justify-between text-gray-500 text-[10px]">
+              <span>BOCD Shift Risk:</span>
+              <span class="font-mono text-purple-300 font-semibold">{p_data.get("bocd_changepoint_prob_pct"):.0f}%</span>
+            </div>"""
+
+        gex_state_div = ""
+        if p_data.get("dealer_gex_regime"):
+            gex_state_label = "+GEX (Stabilizer)" if p_data.get("dealer_gex_regime", "").startswith("+") else "-GEX (Accelerant)"
+            gex_state_div = f"""<div class="flex justify-between text-gray-500 text-[10px]">
+              <span>GEX State:</span>
+              <span class="font-mono text-fuchsia-300 font-semibold">{gex_state_label}</span>
+            </div>"""
 
         proj_cards_html += f"""
         <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm hover:border-purple-500/40 transition flex flex-col justify-between">
@@ -211,27 +178,34 @@ def generate_html_dashboard(
               <span>Conditioned &mu; / &sigma;:</span>
               <span class="font-mono text-gray-400">{p_data.get('effective_drift_pct', 0.0):+.1f}% / {p_data.get('effective_vol_pct', 0.0):.1f}%</span>
             </div>
-            {f'''<div class="flex justify-between text-gray-500 text-[10px]">
-              <span>BOCD Shift Risk:</span>
-              <span class="font-mono text-purple-300 font-semibold">{p_data.get("bocd_changepoint_prob_pct"):.0f}%</span>
-            </div>''' if p_data.get("bocd_changepoint_prob_pct") is not None else ''}
-            {f'''<div class="flex justify-between text-gray-500 text-[10px]">
-              <span>GEX State:</span>
-              <span class="font-mono text-fuchsia-300 font-semibold">{'+GEX (Stabilizer)' if p_data.get('dealer_gex_regime', '').startswith('+') else '-GEX (Accelerant)'}</span>
-            </div>''' if p_data.get("dealer_gex_regime") else ''}
+            {shift_risk_div}
+            {gex_state_div}
           </div>
         </div>
         """
+    return proj_cards_html
 
-    # Build market regime card HTML if available
-    regime = analysis_data.get("regime")
-    regime_html = ""
-    if regime:
-        cp_prob = regime.get("changepoint_prob_pct", 0.0)
-        cp_color = "text-emerald-400" if cp_prob < 25.0 else ("text-amber-400" if cp_prob < 50.0 else "text-red-400")
-        cp_bar_color = "bg-emerald-500" if cp_prob < 25.0 else ("bg-amber-500" if cp_prob < 50.0 else "bg-red-500")
 
-        regime_html = f"""
+def build_regime_card_html(regime: Optional[Dict[str, Any]]) -> str:
+    """
+    Construct modular HTML container for Bayesian Online Changepoint Detection (BOCD) & Macro Regime.
+    """
+    if not regime:
+        return ""
+    cp_prob = regime.get("changepoint_prob_pct", 0.0)
+    cp_color = "text-emerald-400" if cp_prob < 25.0 else ("text-amber-400" if cp_prob < 50.0 else "text-red-400")
+    cp_bar_color = "bg-emerald-500" if cp_prob < 25.0 else ("bg-amber-500" if cp_prob < 50.0 else "bg-red-500")
+    vol_ratio = regime.get("vol_ratio", 1.0)
+    vol_ratio_color = "text-red-400" if vol_ratio > 1.15 else "text-emerald-400"
+    vol_term_text = "Inverted (Stress)" if vol_ratio > 1.15 else "Normal / Contango"
+    vol_status_text = "Elevated short-term vol spike" if vol_ratio > 1.15 else "Stable volatility baseline"
+    credit_mom = regime.get("credit_mom_pct", 0.0)
+    credit_mom_color = "text-emerald-400" if credit_mom >= 0 else "text-amber-400"
+    credit_mom_sign = "+" if credit_mom >= 0 else ""
+    credit_status_text = "Expanding / Risk-On" if credit_mom >= 0 else "Compressing / Defensive"
+    risk_mult = regime.get("risk_multiplier", 1.0)
+
+    return f"""
     <!-- BAYESIAN ONLINE CHANGEPOINT DETECTION (BOCD) & MARKET REGIME ROW -->
     <div class="bg-gray-950/70 border border-teal-900/40 rounded-2xl p-5 shadow-sm">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
@@ -289,17 +263,17 @@ def generate_html_dashboard(
           <div>
             <div class="flex justify-between items-center mb-1">
               <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Realized Vol Surface</span>
-              <span class="text-xs font-bold font-mono {'text-red-400' if regime.get('vol_ratio', 1) > 1.15 else 'text-emerald-400'}">Ratio: {regime.get('vol_ratio', 1):.2f}x</span>
+              <span class="text-xs font-bold font-mono {vol_ratio_color}">Ratio: {vol_ratio:.2f}x</span>
             </div>
             <div class="text-xl font-black text-white mt-1">
               {regime.get('vol_21d_pct', 0):.1f}% <span class="text-xs font-normal text-gray-400">21d Ann. Vol</span>
             </div>
             <div class="text-[11px] text-gray-400 mt-1">
-              5d Vol: <span class="text-gray-200 font-mono">{regime.get('vol_5d_pct', 0):.1f}%</span> | Term: <span class="font-mono text-gray-200">{'Inverted (Stress)' if regime.get('vol_ratio', 1) > 1.15 else 'Normal / Contango'}</span>
+              5d Vol: <span class="text-gray-200 font-mono">{regime.get('vol_5d_pct', 0):.1f}%</span> | Term: <span class="font-mono text-gray-200">{vol_term_text}</span>
             </div>
           </div>
           <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2">
-            Status: <span class="text-gray-200 font-medium">{'Elevated short-term vol spike' if regime.get('vol_ratio', 1) > 1.15 else 'Stable volatility baseline'}</span>
+            Status: <span class="text-gray-200 font-medium">{vol_status_text}</span>
           </div>
         </div>
 
@@ -308,55 +282,58 @@ def generate_html_dashboard(
           <div>
             <div class="flex justify-between items-center mb-1">
               <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Macro Risk Appetite</span>
-              <span class="text-xs font-bold font-mono {'text-emerald-400' if regime.get('credit_mom_pct', 0) >= 0 else 'text-amber-400'}">{'+' if regime.get('credit_mom_pct', 0) >= 0 else ''}{regime.get('credit_mom_pct', 0):.2f}%</span>
+              <span class="text-xs font-bold font-mono {credit_mom_color}">{credit_mom_sign}{credit_mom:.2f}%</span>
             </div>
             <div class="text-xl font-black text-white mt-1">
-              {regime.get('risk_multiplier', 1.0):.1f}x <span class="text-xs font-normal text-gray-400">Sizing Factor</span>
+              {risk_mult:.1f}x <span class="text-xs font-normal text-gray-400">Sizing Factor</span>
             </div>
             <div class="text-[11px] text-gray-400 mt-1">
-              Credit Momentum (HYG/IEI): <span class="font-mono {'text-emerald-400' if regime.get('credit_mom_pct', 0) >= 0 else 'text-amber-400'}">{'Expanding / Risk-On' if regime.get('credit_mom_pct', 0) >= 0 else 'Compressing / Defensive'}</span>
+              Credit Momentum (HYG/IEI): <span class="font-mono {credit_mom_color}">{credit_status_text}</span>
             </div>
           </div>
           <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2">
-            Portfolio Allocation: <span class="text-gray-200 font-medium">{int(regime.get('risk_multiplier', 1.0)*100)}% standard exposure</span>
+            Portfolio Allocation: <span class="text-gray-200 font-medium">{int(risk_mult*100)}% standard exposure</span>
           </div>
         </div>
       </div>
     </div>
     """
 
-    # Build institutional microstructure & AVWAP HTML if available
-    micro = analysis_data.get("microstructure")
-    micro_html = ""
-    if micro:
-        avwap_data = micro.get("avwap", {})
-        ytd = avwap_data.get("ytd", {})
-        h52 = avwap_data.get("high_52w", {})
-        l52 = avwap_data.get("low_52w", {})
-        vp = micro.get("volume_profile", {})
 
-        ytd_val = ytd.get("value")
-        ytd_str = f"${ytd_val:.2f}" if ytd_val is not None else "N/A"
-        ytd_z = ytd.get("zscore")
-        ytd_z_str = f"{ytd_z:+.2f}σ" if ytd_z is not None else "N/A"
-        ytd_z_color = "text-emerald-400" if (ytd_z is not None and 0 <= ytd_z <= 1.5) else ("text-cyan-400" if (ytd_z is not None and -1.5 <= ytd_z < 0) else "text-amber-400")
+def build_microstructure_card_html(micro: Optional[Dict[str, Any]]) -> str:
+    """
+    Construct modular HTML container for Institutional Liquidity, Anchored VWAP (AVWAP) & Volume Profile.
+    """
+    if not micro:
+        return ""
+    avwap_data = micro.get("avwap", {})
+    ytd = avwap_data.get("ytd", {})
+    h52 = avwap_data.get("high_52w", {})
+    l52 = avwap_data.get("low_52w", {})
+    vp = micro.get("volume_profile", {})
 
-        h52_val = h52.get("value")
-        h52_str = f"${h52_val:.2f}" if h52_val is not None else "N/A"
-        l52_val = l52.get("value")
-        l52_str = f"${l52_val:.2f}" if l52_val is not None else "N/A"
+    ytd_val = ytd.get("value")
+    ytd_str = f"${ytd_val:.2f}" if ytd_val is not None else "N/A"
+    ytd_z = ytd.get("zscore")
+    ytd_z_str = f"{ytd_z:+.2f}σ" if ytd_z is not None else "N/A"
+    ytd_z_color = "text-emerald-400" if (ytd_z is not None and 0 <= ytd_z <= 1.5) else ("text-cyan-400" if (ytd_z is not None and -1.5 <= ytd_z < 0) else "text-amber-400")
 
-        poc_val = vp.get("poc")
-        poc_str = f"${poc_val:.2f}" if poc_val is not None else "N/A"
-        vah_val = vp.get("vah")
-        vah_str = f"${vah_val:.2f}" if vah_val is not None else "N/A"
-        val_val = vp.get("val")
-        val_str = f"${val_val:.2f}" if val_val is not None else "N/A"
+    h52_val = h52.get("value")
+    h52_str = f"${h52_val:.2f}" if h52_val is not None else "N/A"
+    l52_val = l52.get("value")
+    l52_str = f"${l52_val:.2f}" if l52_val is not None else "N/A"
 
-        void_status = vp.get("void_status", "Balanced Liquidity")
-        void_badge = "bg-amber-500/10 text-amber-400 border-amber-500/30" if vp.get("in_liquidity_void") else "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"
+    poc_val = vp.get("poc")
+    poc_str = f"${poc_val:.2f}" if poc_val is not None else "N/A"
+    vah_val = vp.get("vah")
+    vah_str = f"${vah_val:.2f}" if vah_val is not None else "N/A"
+    val_val = vp.get("val")
+    val_str = f"${val_val:.2f}" if val_val is not None else "N/A"
 
-        micro_html = f"""
+    void_status = vp.get("void_status", "Balanced Liquidity")
+    void_badge = "bg-amber-500/10 text-amber-400 border-amber-500/30" if vp.get("in_liquidity_void") else "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"
+
+    return f"""
     <!-- INSTITUTIONAL LIQUIDITY, ANCHORED VWAP & VOLUME PROFILE ROW -->
     <div class="bg-gray-950/70 border border-cyan-900/40 rounded-2xl p-5 shadow-sm">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
@@ -450,74 +427,76 @@ def generate_html_dashboard(
     </div>
     """
 
-    # Build Institutional Derivatives & Dealer Gamma Exposure Card
-    derivatives = analysis_data.get("derivatives")
-    derivatives_html = ""
-    if derivatives:
-        net_gex = derivatives.get("net_gex_millions", 0.0)
-        net_gex_color = "text-emerald-400" if net_gex >= 0 else "text-rose-400"
-        net_gex_sign = "+" if net_gex >= 0 else ""
-        gex_regime_title = derivatives.get("regime", "N/A")
-        badge_class = derivatives.get("badge_class", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" if net_gex >= 0 else "bg-rose-500/10 text-rose-400 border-rose-500/30")
-        gamma_flip = derivatives.get("gamma_flip_price", 0.0)
-        dist_flip = derivatives.get("dist_to_flip_pct", 0.0)
-        call_wall = derivatives.get("call_wall", 0.0)
-        put_wall = derivatives.get("put_wall", 0.0)
-        max_pain = derivatives.get("max_pain", 0.0)
-        vrp = derivatives.get("vrp_pct", 0.0)
-        rr25 = derivatives.get("rr25_skew", 0.0)
-        skew_regime = derivatives.get("skew_regime", "Normal Equity Skew")
-        spot_price = float(df["close"].iloc[-1]) if "close" in df.columns else 0.0
 
-        # Build Strike Profile rows for table/bars
-        strike_profile = derivatives.get("strike_profile", [])
-        near_strikes = [s for s in strike_profile if spot_price * 0.88 <= s["strike"] <= spot_price * 1.12]
-        if not near_strikes:
-            near_strikes = strike_profile[:12]
+def build_derivatives_card_html(derivatives: Optional[Dict[str, Any]], spot_price: float = 0.0) -> str:
+    """
+    Construct modular HTML container for Institutional Derivatives & Dealer Gamma Exposure (GEX).
+    """
+    if not derivatives:
+        return ""
+    net_gex = derivatives.get("net_gex_millions", 0.0)
+    net_gex_color = "text-emerald-400" if net_gex >= 0 else "text-rose-400"
+    net_gex_sign = "+" if net_gex >= 0 else ""
+    gex_regime_title = derivatives.get("regime", "N/A")
+    badge_class = derivatives.get("badge_class", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" if net_gex >= 0 else "bg-rose-500/10 text-rose-400 border-rose-500/30")
+    gamma_flip = derivatives.get("gamma_flip_price", 0.0)
+    dist_flip = derivatives.get("dist_to_flip_pct", 0.0)
+    call_wall = derivatives.get("call_wall", 0.0)
+    put_wall = derivatives.get("put_wall", 0.0)
+    max_pain = derivatives.get("max_pain", 0.0)
+    vrp = derivatives.get("vrp_pct", 0.0)
+    rr25 = derivatives.get("rr25_skew", 0.0)
+    skew_regime = derivatives.get("skew_regime", "Normal Equity Skew")
 
-        max_abs_gex = max([abs(s.get("net_gex_m", 0.0)) for s in near_strikes] + [1.0])
+    # Build Strike Profile rows for table/bars
+    strike_profile = derivatives.get("strike_profile", [])
+    near_strikes = [s for s in strike_profile if spot_price * 0.88 <= s.get("strike", 0.0) <= spot_price * 1.12]
+    if not near_strikes:
+        near_strikes = strike_profile[:12]
 
-        strike_bars_html = ""
-        for s in near_strikes:
-            k = s["strike"]
-            net_val = s.get("net_gex_m", 0.0)
-            call_g = s.get("call_gex_m", 0.0)
-            put_g = s.get("put_gex_m", 0.0)
-            oi = s.get("open_interest", 0)
+    max_abs_gex = max([abs(s.get("net_gex_m", 0.0)) for s in near_strikes] + [1.0])
 
-            tag = ""
-            row_bg = ""
-            if abs(k - spot_price) == min(abs(x["strike"] - spot_price) for x in near_strikes):
-                tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-blue-500/20 text-blue-300 rounded border border-blue-500/40">SPOT</span>'
-                row_bg = "bg-blue-950/20"
-            elif k == call_wall:
-                tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-emerald-500/20 text-emerald-300 rounded border border-emerald-500/40">CALL WALL</span>'
-                row_bg = "bg-emerald-950/20"
-            elif k == put_wall:
-                tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-rose-500/20 text-rose-300 rounded border border-rose-500/40">PUT WALL</span>'
-                row_bg = "bg-rose-950/20"
-            elif k == max_pain:
-                tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-purple-500/20 text-purple-300 rounded border border-purple-500/40">MAX PAIN</span>'
+    strike_bars_html = ""
+    for s in near_strikes:
+        k = s.get("strike", 0.0)
+        net_val = s.get("net_gex_m", 0.0)
+        call_g = s.get("call_gex_m", 0.0)
+        put_g = s.get("put_gex_m", 0.0)
+        oi = s.get("open_interest", 0)
 
-            bar_pct = min(100, max(4, int(abs(net_val) / max_abs_gex * 100)))
-            bar_color = "bg-emerald-500" if net_val >= 0 else "bg-rose-500"
+        tag = ""
+        row_bg = ""
+        if abs(k - spot_price) == min(abs(x.get("strike", 0.0) - spot_price) for x in near_strikes):
+            tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-blue-500/20 text-blue-300 rounded border border-blue-500/40">SPOT</span>'
+            row_bg = "bg-blue-950/20"
+        elif k == call_wall:
+            tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-emerald-500/20 text-emerald-300 rounded border border-emerald-500/40">CALL WALL</span>'
+            row_bg = "bg-emerald-950/20"
+        elif k == put_wall:
+            tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-rose-500/20 text-rose-300 rounded border border-rose-500/40">PUT WALL</span>'
+            row_bg = "bg-rose-950/20"
+        elif k == max_pain:
+            tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-purple-500/20 text-purple-300 rounded border border-purple-500/40">MAX PAIN</span>'
 
-            strike_bars_html += f"""
-            <tr class="border-b border-gray-800/50 hover:bg-gray-800/30 text-xs font-mono {row_bg}">
-              <td class="py-1 px-2 font-bold text-white">${k:.2f} {tag}</td>
-              <td class="py-1 px-2 text-right text-emerald-400">+{call_g:.2f}</td>
-              <td class="py-1 px-2 text-right text-rose-400">{put_g:.2f}</td>
-              <td class="py-1 px-2 text-right font-bold {'text-emerald-400' if net_val >= 0 else 'text-rose-400'}">{net_val:+.2f}</td>
-              <td class="py-1 px-2 w-32">
-                <div class="w-full bg-gray-800 rounded-full h-1.5 overflow-hidden">
-                  <div class="h-full {bar_color} rounded-full" style="width: {bar_pct}%;"></div>
-                </div>
-              </td>
-              <td class="py-1 px-2 text-right text-gray-400">{oi:,}</td>
-            </tr>
-            """
+        bar_pct = min(100, max(4, int(abs(net_val) / max_abs_gex * 100)))
+        bar_color = "bg-emerald-500" if net_val >= 0 else "bg-rose-500"
 
-        derivatives_html = f"""
+        strike_bars_html += f"""
+        <tr class="border-b border-gray-800/50 hover:bg-gray-800/30 text-xs font-mono {row_bg}">
+          <td class="py-1 px-2 font-bold text-white">${k:.2f} {tag}</td>
+          <td class="py-1 px-2 text-right text-emerald-400">+{call_g:.2f}</td>
+          <td class="py-1 px-2 text-right text-rose-400">{put_g:.2f}</td>
+          <td class="py-1 px-2 text-right font-bold {'text-emerald-400' if net_val >= 0 else 'text-rose-400'}">{net_val:+.2f}</td>
+          <td class="py-1 px-2 w-32">
+            <div class="w-full bg-gray-800 rounded-full h-1.5 overflow-hidden">
+              <div class="h-full {bar_color} rounded-full" style="width: {bar_pct}%;"></div>
+            </div>
+          </td>
+          <td class="py-1 px-2 text-right text-gray-400">{oi:,}</td>
+        </tr>
+        """
+
+    return f"""
     <!-- INSTITUTIONAL DERIVATIVES & DEALER GAMMA EXPOSURE (GEX) ROW -->
     <div class="bg-gray-950/70 border border-fuchsia-900/40 rounded-2xl p-5 shadow-sm">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
@@ -653,111 +632,108 @@ def generate_html_dashboard(
     </div>
     """
 
-    # Build Corporate Catalyst Awareness & PEAD Models Card
-    events = analysis_data.get("events")
-    events_html = ""
-    if events:
-        cat_info = events.get("catalyst_status") or events.get("catalyst") or {}
-        pead_info = events.get("pead") or {}
-        degross_info = events.get("degrossing") or {}
 
-        status_code = cat_info.get("status_code", "SAFE")
-        status_desc = cat_info.get("status_description", "No imminent binary event risk within 5 business days.")
-        next_earn_date = cat_info.get("next_earnings_date") or events.get("next_earnings_date") or "TBD"
-        days_earn = cat_info.get("days_to_earnings") if cat_info.get("days_to_earnings") is not None else events.get("earnings_days_away")
-        next_macro_event = cat_info.get("next_macro_event", "FOMC / CPI")
-        next_macro_date = cat_info.get("next_macro_date", "TBD")
-        days_macro = cat_info.get("days_to_macro")
+def build_events_card_html(events: Optional[Dict[str, Any]]) -> str:
+    """
+    Construct modular HTML container for Corporate Catalyst Awareness & PEAD Models.
+    """
+    if not events:
+        return ""
+    cat_info = events.get("catalyst_status") or events.get("catalyst") or {}
+    pead_info = events.get("pead") or {}
+    degross_info = events.get("degrossing") or {}
 
-        # Haircut & advice
-        haircut = degross_info.get("position_haircut", events.get("degross_multiplier", 1.0))
-        haircut_pct = int(haircut * 100)
-        risk_advice = degross_info.get("risk_advice", "Maintain full institutional risk budget.")
-        gap_sd = degross_info.get("binary_gap_sd", 0.0)
+    status_code = cat_info.get("status_code", "SAFE")
+    status_desc = cat_info.get("status_description", "No imminent binary event risk within 5 business days.")
+    next_earn_date = cat_info.get("next_earnings_date") or events.get("next_earnings_date") or "TBD"
+    days_earn = cat_info.get("days_to_earnings") if cat_info.get("days_to_earnings") is not None else events.get("earnings_days_away")
+    next_macro_event = cat_info.get("next_macro_event", "FOMC / CPI")
+    next_macro_date = cat_info.get("next_macro_date", "TBD")
+    days_macro = cat_info.get("days_to_macro")
 
-        # Status badge styling
-        if status_code in ("CRITICAL_EVENT", "IMMINENT_DEGROSS"):
-            badge_cat = "bg-rose-500/10 text-rose-400 border-rose-500/30"
-            status_color = "text-rose-400"
-            pulse_color = "bg-rose-400"
-            status_label = "IMMINENT EVENT RISK / DE-GROSS"
-        elif status_code == "APPROACHING":
-            badge_cat = "bg-amber-500/10 text-amber-400 border-amber-500/30"
-            status_color = "text-amber-400"
-            pulse_color = "bg-amber-400"
-            status_label = "APPROACHING CATALYST (50% HAIRCUT)"
-        else:
-            badge_cat = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
-            status_color = "text-emerald-400"
-            pulse_color = "bg-emerald-400"
-            status_label = "SAFE LIQUIDITY WINDOW"
+    # Haircut & advice
+    haircut = degross_info.get("position_haircut", events.get("degross_multiplier", 1.0))
+    haircut_pct = int(haircut * 100)
+    risk_advice = degross_info.get("risk_advice", "Maintain full institutional risk budget.")
+    gap_sd = degross_info.get("binary_gap_sd", 0.0)
 
-        # PEAD info
-        pead_regime = pead_info.get("drift_regime", "NEUTRAL")
-        sue = pead_info.get("sue_score", 0.0)
-        gap_pct = pead_info.get("announcement_gap_pct", 0.0)
-        drift_pct = pead_info.get("post_earnings_drift_pct", 0.0)
-        recent_earn_date = pead_info.get("recent_announcement_date", "N/A")
+    # Status badge styling
+    if status_code in ("CRITICAL_EVENT", "IMMINENT_DEGROSS"):
+        badge_cat = "bg-rose-500/10 text-rose-400 border-rose-500/30"
+        status_color = "text-rose-400"
+        pulse_color = "bg-rose-400"
+    elif status_code == "APPROACHING":
+        badge_cat = "bg-amber-500/10 text-amber-400 border-amber-500/30"
+        status_color = "text-amber-400"
+        pulse_color = "bg-amber-400"
+    else:
+        badge_cat = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+        status_color = "text-emerald-400"
+        pulse_color = "bg-emerald-400"
 
-        if "bullish" in pead_regime.lower():
-            pead_badge = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
-            pead_regime_label = "Bullish Post-Earnings Drift"
-            pead_color = "text-emerald-400"
-        elif "bearish" in pead_regime.lower():
-            pead_badge = "bg-rose-500/10 text-rose-400 border-rose-500/30"
-            pead_regime_label = "Bearish Post-Earnings Drift"
-            pead_color = "text-rose-400"
-        else:
-            pead_badge = "bg-gray-800 text-gray-400 border-gray-700"
-            pead_regime_label = "Neutral Drift Regime"
-            pead_color = "text-gray-400"
+    # PEAD info
+    pead_regime = pead_info.get("drift_regime", "NEUTRAL")
+    sue = pead_info.get("sue_score", 0.0)
+    gap_pct = pead_info.get("announcement_gap_pct", 0.0)
+    drift_pct = pead_info.get("post_earnings_drift_pct", 0.0)
+    recent_earn_date = pead_info.get("recent_announcement_date", "N/A")
 
-        # Recent Earnings History rows
-        earn_history = events.get("recent_earnings_history", [])
-        earn_rows_html = ""
-        for h in reversed(earn_history[-4:]):
-            dt = h.get("date", "N/A")
-            act = h.get("actual_eps")
-            est = h.get("estimated_eps")
-            surp = h.get("surprise_pct")
-            h_sue = h.get("sue_score")
-            h_gap = h.get("announcement_gap_pct")
-            h_drift = h.get("drift_30d_pct")
+    if "bullish" in pead_regime.lower():
+        pead_badge = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+        pead_color = "text-emerald-400"
+    elif "bearish" in pead_regime.lower():
+        pead_badge = "bg-rose-500/10 text-rose-400 border-rose-500/30"
+        pead_color = "text-rose-400"
+    else:
+        pead_badge = "bg-gray-800 text-gray-400 border-gray-700"
+        pead_color = "text-gray-400"
 
-            act_str = f"${act:.2f}" if act is not None else "N/A"
-            est_str = f"${est:.2f}" if est is not None else "N/A"
-            surp_str = f"{surp:+.1f}%" if surp is not None else "N/A"
-            surp_color = "text-emerald-400" if (surp and surp > 0) else ("text-rose-400" if (surp and surp < 0) else "text-gray-400")
-            sue_str = f"{h_sue:+.2f}" if h_sue is not None else "N/A"
-            gap_str = f"{h_gap:+.2f}%" if h_gap is not None else "N/A"
-            gap_color = "text-emerald-400" if (h_gap and h_gap > 0) else ("text-rose-400" if (h_gap and h_gap < 0) else "text-gray-400")
-            drift_str = f"{h_drift:+.2f}%" if h_drift is not None else "N/A"
-            drift_color = "text-emerald-400" if (h_drift and h_drift > 0) else ("text-rose-400" if (h_drift and h_drift < 0) else "text-gray-400")
+    # Recent Earnings History rows
+    earn_history = events.get("recent_earnings_history", [])
+    earn_rows_html = ""
+    for h in reversed(earn_history[-4:]):
+        dt = h.get("date", "N/A")
+        act = h.get("actual_eps")
+        est = h.get("estimated_eps")
+        surp = h.get("surprise_pct")
+        h_sue = h.get("sue_score")
+        h_gap = h.get("announcement_gap_pct")
+        h_drift = h.get("drift_30d_pct")
 
-            tag_class = "bg-emerald-950/40 text-emerald-300 border-emerald-700/50" if (h_sue and h_sue > 0.5) else (
-                "bg-rose-950/40 text-rose-300 border-rose-700/50" if (h_sue and h_sue < -0.5) else "bg-gray-800 text-gray-300 border-gray-700"
-            )
-            tag_label = "BEAT" if (h_sue and h_sue > 0.5) else ("MISS" if (h_sue and h_sue < -0.5) else "IN-LINE")
+        act_str = f"${act:.2f}" if act is not None else "N/A"
+        est_str = f"${est:.2f}" if est is not None else "N/A"
+        surp_str = f"{surp:+.1f}%" if surp is not None else "N/A"
+        surp_color = "text-emerald-400" if (surp and surp > 0) else ("text-rose-400" if (surp and surp < 0) else "text-gray-400")
+        sue_str = f"{h_sue:+.2f}" if h_sue is not None else "N/A"
+        gap_str = f"{h_gap:+.2f}%" if h_gap is not None else "N/A"
+        gap_color = "text-emerald-400" if (h_gap and h_gap > 0) else ("text-rose-400" if (h_gap and h_gap < 0) else "text-gray-400")
+        drift_str = f"{h_drift:+.2f}%" if h_drift is not None else "N/A"
+        drift_color = "text-emerald-400" if (h_drift and h_drift > 0) else ("text-rose-400" if (h_drift and h_drift < 0) else "text-gray-400")
 
-            earn_rows_html += f"""
-            <tr class="border-b border-gray-800/50 hover:bg-gray-800/30 text-xs font-mono">
-              <td class="py-1.5 px-3 font-bold text-white flex items-center gap-2">
-                <span>{dt}</span>
-                <span class="text-[9px] font-bold px-1.5 py-0.5 rounded border {tag_class}">{tag_label}</span>
-              </td>
-              <td class="py-1.5 px-3 text-right text-gray-300">{est_str}</td>
-              <td class="py-1.5 px-3 text-right text-white font-bold">{act_str}</td>
-              <td class="py-1.5 px-3 text-right font-bold {surp_color}">{surp_str}</td>
-              <td class="py-1.5 px-3 text-right font-mono text-gray-300">{sue_str}</td>
-              <td class="py-1.5 px-3 text-right font-bold {gap_color}">{gap_str}</td>
-              <td class="py-1.5 px-3 text-right font-bold {drift_color}">{drift_str}</td>
-            </tr>
-            """
+        tag_class = "bg-emerald-950/40 text-emerald-300 border-emerald-700/50" if (h_sue and h_sue > 0.5) else (
+            "bg-rose-950/40 text-rose-300 border-rose-700/50" if (h_sue and h_sue < -0.5) else "bg-gray-800 text-gray-300 border-gray-700"
+        )
+        tag_label = "BEAT" if (h_sue and h_sue > 0.5) else ("MISS" if (h_sue and h_sue < -0.5) else "IN-LINE")
 
-        days_earn_display = f"{days_earn} Days" if days_earn is not None else "TBD"
-        days_macro_display = f"{days_macro} Days" if days_macro is not None else "TBD"
+        earn_rows_html += f"""
+        <tr class="border-b border-gray-800/50 hover:bg-gray-800/30 text-xs font-mono">
+          <td class="py-1.5 px-3 font-bold text-white flex items-center gap-2">
+            <span>{dt}</span>
+            <span class="text-[9px] font-bold px-1.5 py-0.5 rounded border {tag_class}">{tag_label}</span>
+          </td>
+          <td class="py-1.5 px-3 text-right text-gray-300">{est_str}</td>
+          <td class="py-1.5 px-3 text-right text-white font-bold">{act_str}</td>
+          <td class="py-1.5 px-3 text-right font-bold {surp_color}">{surp_str}</td>
+          <td class="py-1.5 px-3 text-right font-mono text-gray-300">{sue_str}</td>
+          <td class="py-1.5 px-3 text-right font-bold {gap_color}">{gap_str}</td>
+          <td class="py-1.5 px-3 text-right font-bold {drift_color}">{drift_str}</td>
+        </tr>
+        """
 
-        events_html = f"""
+    days_earn_display = f"{days_earn} Days" if days_earn is not None else "TBD"
+    days_macro_display = f"{days_macro} Days" if days_macro is not None else "TBD"
+
+    return f"""
     <!-- CORPORATE CATALYST AWARENESS & PEAD MODELS ROW -->
     <div class="bg-gray-950/70 border border-teal-900/40 rounded-2xl p-5 shadow-sm">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
@@ -885,16 +861,80 @@ def generate_html_dashboard(
     </div>
     """
 
-    # Convert payloads to JSON
-    json_history = json.dumps(history_payload)
-    json_best_buys = json.dumps(best_buys)
-    json_predictive = json.dumps(pred)
-    json_performance = json.dumps(perf)
-    json_projections = json.dumps(projections)
-    json_regime = json.dumps(regime) if regime else "{}"
-    json_micro = json.dumps(micro) if micro else "{}"
-    json_derivatives = json.dumps(derivatives) if derivatives else "{}"
-    json_events = json.dumps(events) if events else "{}"
+
+def generate_html_dashboard(
+    data_input: Union[Dict[str, Any], str, Path],
+    output_path: Union[str, Path],
+    json_path: Optional[Union[str, Path]] = None,
+) -> Path:
+    """
+    Generate an interactive, zero-dependency, self-contained HTML dashboard.
+    Step 2 of the decoupled reporting pipeline: reads canonical JSON dataset
+    and produces a standalone HTML report with embedded data.
+    """
+    output_file = Path(output_path).expanduser().resolve()
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Resolve canonical analysis data contract from input
+    if isinstance(data_input, (str, Path)):
+        resolved_json_input = Path(data_input).expanduser().resolve()
+        canonical_data = load_analysis_json(resolved_json_input)
+        if json_path is None:
+            json_path = resolved_json_input
+    elif isinstance(data_input, dict):
+        # Check if raw engine output (DataFrame historical_data) or canonical payload
+        if isinstance(data_input.get("historical_data"), pd.DataFrame):
+            canonical_data = prepare_analysis_json_payload(data_input)
+        else:
+            canonical_data = data_input
+    else:
+        raise TypeError(f"data_input must be a dict or path to .json file, got {type(data_input)}")
+
+    # 2. Guarantee companion .json file exists on disk (Step 1 parity)
+    symbol = canonical_data.get("symbol", canonical_data.get("metadata", {}).get("symbol", "UNKNOWN"))
+    meta = canonical_data.get("metadata", {})
+    req_date = meta.get("request_date", canonical_data.get("request_date", canonical_data.get("performance", {}).get("latest_date", "")))
+    is_up_to_date = meta.get("is_up_to_date", canonical_data.get("is_up_to_date", True))
+
+    target_json_path = Path(json_path) if json_path else resolve_json_path(symbol, output=output_file, report_date=req_date)
+    if not target_json_path.exists():
+        export_analysis_json(canonical_data, target_json_path)
+
+    # 3. Unpack canonical fields for HTML template rendering
+    perf = canonical_data.get("performance", {})
+    best_buys = canonical_data.get("best_buys", [])
+    pred = canonical_data.get("predictive", {})
+    projections = canonical_data.get("projections", {})
+    regime = canonical_data.get("regime")
+    micro = canonical_data.get("microstructure")
+    derivatives = canonical_data.get("derivatives")
+    events = canonical_data.get("events")
+    hist = canonical_data.get("historical_data", [])
+
+    spot_price = float(perf.get("latest_price") or (hist[-1]["close"] if hist and "close" in hist[-1] else 0.0))
+
+    # Color palette based on recommendation
+    rec_colors = {
+        "STRONG BUY": ("#10b981", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"),
+        "STRONG BUY / TREND ACCUMULATION": ("#10b981", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"),
+        "BUY ON PULLBACK": ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"),
+        "ACCUMULATE / DIP BUY": ("#06b6d4", "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"),
+        "RANGE ACCUMULATION / BUY SUPPORT": ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"),
+        "HOLD / CAUTIOUS BUY": ("#f59e0b", "bg-amber-500/10 text-amber-400 border-amber-500/30"),
+        "REGIME SHIFT ALERT / PAUSE ENTRIES": ("#f59e0b", "bg-amber-500/10 text-amber-400 border-amber-500/30"),
+        "RISK-OFF / CAPITAL PRESERVATION": ("#ef4444", "bg-red-500/10 text-red-400 border-red-500/30"),
+    }
+    rec_color, rec_badge_class = rec_colors.get(pred.get("recommendation", ""), ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"))
+
+    # Build modular HTML cards
+    proj_cards_html = build_projection_cards_html(projections)
+    regime_html = build_regime_card_html(regime)
+    micro_html = build_microstructure_card_html(micro)
+    derivatives_html = build_derivatives_card_html(derivatives, spot_price=spot_price)
+    events_html = build_events_card_html(events)
+
+    # Embed canonical JSON payload for browser client execution without CORS restrictions
+    json_embedded_payload = json.dumps(canonical_data, ensure_ascii=False).replace("</script>", "<\\/script>")
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -1297,14 +1337,20 @@ def generate_html_dashboard(
 
   </div>
 
+  <!-- EMBEDDED CANONICAL DATA CONTRACT (Zero CORS Local file:/// and Web Compatible) -->
+  <script id="report-data" type="application/json">
+{json_embedded_payload}
+  </script>
+
   <!-- INTERACTIVE JAVASCRIPT ENGINE -->
   <script>
-    const RAW_HISTORY = {json_history};
-    const BEST_BUYS = {json_best_buys};
-    const PREDICTIVE = {json_predictive};
-    const PERFORMANCE = {json_performance};
-    const DERIVATIVES = {json_derivatives};
-    const EVENTS = {json_events};
+    const REPORT_DATA = JSON.parse(document.getElementById('report-data').textContent);
+    const RAW_HISTORY = REPORT_DATA.historical_data || [];
+    const BEST_BUYS = REPORT_DATA.best_buys || [];
+    const PREDICTIVE = REPORT_DATA.predictive || {{}};
+    const PERFORMANCE = REPORT_DATA.performance || {{}};
+    const DERIVATIVES = REPORT_DATA.derivatives || {{}};
+    const EVENTS = REPORT_DATA.events || {{}};
     const MOMENTUM_EVENTS = (EVENTS && EVENTS.momentum_events) ? EVENTS.momentum_events : [];
 
     let currentPeriod = '5Y';
@@ -2615,8 +2661,20 @@ def main():
         "--symbol",
         "-s",
         type=str,
-        required=True,
-        help="Stock ticker symbol (e.g. MSFT, VOO, NVDA).",
+        default=None,
+        help="Stock ticker symbol (e.g. MSFT, VOO, NVDA). Required unless --from_json is provided.",
+    )
+    parser.add_argument(
+        "--from_json",
+        type=str,
+        default=None,
+        help="Path to pre-generated .json analysis dataset. Skips recalculation and renders the HTML dashboard directly from JSON (Step 2 only).",
+    )
+    parser.add_argument(
+        "--json_only",
+        action="store_true",
+        default=False,
+        help="Only export the companion .json analysis data file (Step 1) and skip HTML report generation.",
     )
     parser.add_argument(
         "--data_dir",
@@ -2679,20 +2737,55 @@ def main():
 
     args = parser.parse_args()
 
-    symbol = args.symbol.upper()
-    data_dir = args.data_dir
-    req_date = args.request_date if args.request_date else datetime.date.today().strftime("%Y-%m-%d")
-    output_path = resolve_report_path(symbol, report_dir=args.report_dir, output=args.output, report_date=req_date)
+    if not args.symbol and not args.from_json:
+        parser.error("Either --symbol (-s) or --from_json must be specified.")
 
-    # Run analytical engine (ensures data is up-to-date for req_date before running)
-    analysis_data = run_stock_analysis(
-        symbol=symbol,
-        data_dir=data_dir,
-        forecast_days=args.days_forecast,
-        auto_download=args.auto_download,
-        start=args.start,
-        request_date=req_date,
-    )
+    if args.from_json:
+        json_file_path = Path(args.from_json).expanduser().resolve()
+        analysis_data = load_analysis_json(json_file_path)
+        symbol = analysis_data.get("symbol", analysis_data.get("metadata", {}).get("symbol", "UNKNOWN")).upper()
+        meta = analysis_data.get("metadata", {})
+        req_date = meta.get("request_date", analysis_data.get("performance", {}).get("latest_date", ""))
+        output_path = resolve_report_path(symbol, report_dir=args.report_dir, output=args.output, report_date=req_date)
+        json_path = json_file_path
+        data_dir = args.data_dir
+        latest_date_str = meta.get("latest_data_date", analysis_data.get("latest_data_date", ""))
+        is_up_to_date_val = meta.get("is_up_to_date", analysis_data.get("is_up_to_date", True))
+    else:
+        symbol = args.symbol.upper()
+        data_dir = args.data_dir
+        req_date = args.request_date if args.request_date else datetime.date.today().strftime("%Y-%m-%d")
+        output_path = resolve_report_path(symbol, report_dir=args.report_dir, output=args.output, report_date=req_date)
+        json_path = resolve_json_path(symbol, report_dir=args.report_dir, output=args.output, report_date=req_date)
+
+        # Step 1: Run analytical engine and export companion .json file
+        raw_analysis = run_stock_analysis(
+            symbol=symbol,
+            data_dir=data_dir,
+            forecast_days=args.days_forecast,
+            auto_download=args.auto_download,
+            start=args.start,
+            request_date=req_date,
+        )
+        export_analysis_json(raw_analysis, json_path)
+        logger.info(f"[Step 1 Complete] Analysis dataset exported to: {json_path}")
+
+        if args.json_only:
+            print(f"\n=======================================================")
+            print(f" STOCK PERFORMANCE & PREDICTIVE BUY TIMING ANALYZER ")
+            print(f"=======================================================")
+            print(f"Symbol:           {symbol}")
+            print(f"Report Requested: {req_date}")
+            print(f"Data Directory:   {data_dir}")
+            print(f"Output Dataset:   {json_path} (JSON Only Mode)")
+            print(f"=======================================================")
+            print(f"\n[SUCCESS] JSON analysis dataset generated at: {json_path.resolve()}")
+            return
+
+        # Step 2: Read data from .json file
+        analysis_data = load_analysis_json(json_path)
+        latest_date_str = analysis_data.get("metadata", {}).get("latest_data_date", raw_analysis.get("latest_data_date", ""))
+        is_up_to_date_val = analysis_data.get("metadata", {}).get("is_up_to_date", raw_analysis.get("is_up_to_date", True))
 
     print(f"\n=======================================================")
     print(f" STOCK PERFORMANCE & PREDICTIVE BUY TIMING ANALYZER ")
@@ -2700,13 +2793,14 @@ def main():
     print(f"Symbol:           {symbol}")
     print(f"Report Requested: {req_date}")
     print(f"Data Directory:   {data_dir}")
-    print(f"Data Freshness:   Through {analysis_data['latest_data_date']} ({'Up-to-Date' if analysis_data['is_up_to_date'] else 'Latest available'})")
+    print(f"Data Freshness:   Through {latest_date_str} ({'Up-to-Date' if is_up_to_date_val else 'Latest available'})")
     print(f"Auto Download:    {args.auto_download}")
     print(f"Forecast Days:    {args.days_forecast} (~3 months)")
+    print(f"JSON Dataset:     {json_path}")
     print(f"Output Report:    {output_path}\n")
 
-    # Generate visual dashboard
-    report_file = generate_html_dashboard(analysis_data, output_path)
+    # Step 2: Generate visual dashboard from JSON dataset
+    report_file = generate_html_dashboard(analysis_data, output_path, json_path=json_path)
 
     # Print summary to terminal
     perf = analysis_data["performance"]
