@@ -18,7 +18,6 @@ import webbrowser
 from pathlib import Path
 from typing import Dict, Any, Union, Optional
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("VisualizeStockAnalysis")
