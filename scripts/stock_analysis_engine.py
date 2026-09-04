@@ -41,6 +41,14 @@ except Exception:
     except Exception:
         MarketRegimeClassifier = None
 
+try:
+    from qlib.contrib.microstructure import compute_microstructure_features
+except Exception:
+    try:
+        from microstructure import compute_microstructure_features
+    except Exception:
+        compute_microstructure_features = None
+
 
 # ----------------------------------------------------------------------
 # 1. Data Ingestion Layer (Qlib Binary + CSV Discovery & Freshness)
@@ -610,19 +618,24 @@ def predict_future_buy_timing(
     df: pd.DataFrame,
     forecast_days: int = 63,  # ~3 months (21 trading days / month)
     simulations: int = 1000,
+    regime: Optional[Dict[str, Any]] = None,
+    microstructure: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Perform quantitative and machine-learning predictive analysis on when the stock
-    should be bought within the next 3 months (~63 trading days) from the current date.
+    should be bought within the next 3 months (~63 trading days) from the current date,
+    conditioned on Bayesian Online Changepoint Detection (BOCD) regime states and
+    institutional microstructure (Anchored VWAP & Volume Profile).
 
     Outputs:
     - Projected 3-month daily price path (10th percentile bear, 50th median, 90th bull).
+    - BOCD regime state & forward changepoint hazard probabilities.
     - Optimal Entry Price Range (support level / pullback target).
     - Optimal Buy Window (estimated date range within the next 3 months).
     - 3-Month Target Price and Expected Upside %.
     - Stop-Loss Invalidation Price.
     - Risk/Reward Ratio.
-    - Tactical Recommendation Rating (STRONG BUY, BUY ON PULLBACK, ACCUMULATE, HOLD).
+    - Tactical Recommendation Rating conditioned on market regime.
     """
     df = df.copy().sort_values("date").reset_index(drop=True)
     if len(df) < 50:
@@ -656,7 +669,35 @@ def predict_future_buy_timing(
     rs = gain / (loss + 1e-9)
     current_rsi = float((100 - (100 / (1 + rs))).iloc[-1])
 
-    # 2. Generate future business/trading dates
+    # 2. Parse BOCD Regime Parameters
+    regime_state = None
+    regime_name = None
+    cp_hazard_pct = None
+    forward_cp_prob = None
+    exp_run_length = 63.0
+    risk_mult = 1.0
+
+    if regime and isinstance(regime, dict):
+        regime_state = regime.get("state")
+        regime_name = regime.get("name")
+        cp_hazard_pct = float(regime.get("changepoint_prob_pct", 0.0))
+        exp_run_length = float(regime.get("expected_run_length_days", 63.0))
+        risk_mult = float(regime.get("risk_multiplier", 1.0))
+        vol_21d_pct = regime.get("vol_21d_pct")
+        if vol_21d_pct is not None and vol_21d_pct > 0:
+            daily_vol = (float(vol_21d_pct) / 100.0) / math.sqrt(252.0)
+
+        vol_ratio = float(regime.get("vol_ratio", 1.0))
+        if vol_ratio > 1.15:
+            daily_vol *= 1.15
+
+        # Bayesian Online Changepoint Detection cumulative hazard over the forecast horizon
+        h_daily = 1.0 / max(10.0, exp_run_length)
+        forward_cp_prob = (1.0 - (1.0 - h_daily) ** forecast_days) * 100.0
+    else:
+        h_daily = 0.0
+
+    # 3. Generate future business/trading dates
     future_dates = []
     curr = latest_dt
     while len(future_dates) < forecast_days:
@@ -664,14 +705,13 @@ def predict_future_buy_timing(
         if curr.weekday() < 5:  # Monday to Friday
             future_dates.append(curr.strftime("%Y-%m-%d"))
 
-    # 3. Monte Carlo & Trend Decomposition Simulation
-    # Geometric Brownian Motion with Mean-Reversion Component
+    # 4. Monte Carlo & Trend Decomposition Simulation
+    # Geometric Brownian Motion with Mean-Reversion Component + BOCD Regime Jump Shocks
     np.random.seed(42)
-    daily_vol_clamped = max(0.005, min(0.04, daily_vol))
-    # Damped drift to prevent explosive divergence
-    adj_drift = max(-0.001, min(0.0015, drift))
+    daily_vol_clamped = max(0.005, min(0.045, daily_vol))
+    # Drift conditioned on regime risk multiplier
+    adj_drift = max(-0.0015, min(0.0015, drift * risk_mult))
 
-    # Long term anchor: 200 SMA trend growth
     price_paths = np.zeros((simulations, forecast_days))
     price_paths[:, 0] = current_price
 
@@ -680,6 +720,17 @@ def predict_future_buy_timing(
         # Pull toward 50-day / 200-day trend channel
         reversion = 0.02 * (sma50 - price_paths[:, t - 1]) / price_paths[:, t - 1]
         step_return = adj_drift + reversion + daily_vol_clamped * z
+
+        # BOCD structural regime changepoint jump shocks:
+        # With hazard probability h_daily, paths experience a fat-tailed structural regime break
+        if h_daily > 0:
+            jump_occurred = np.random.rand(simulations) < h_daily
+            if np.any(jump_occurred):
+                # Regime jump shock scale: 1.5x daily vol, with negative skew in Risk-Off
+                jump_direction = -0.5 * daily_vol_clamped if regime_state == 2 else 0.0
+                jump_shocks = np.random.laplace(loc=jump_direction, scale=1.5 * daily_vol_clamped, size=simulations)
+                step_return += jump_occurred * jump_shocks
+
         price_paths[:, t] = price_paths[:, t - 1] * (1.0 + step_return)
 
     # Percentiles
@@ -687,7 +738,7 @@ def predict_future_buy_timing(
     p50_median = np.percentile(price_paths, 50, axis=0)
     p90_bull = np.percentile(price_paths, 90, axis=0)
 
-    # 4. Optimal Buy Timing & Entry Zone Identification
+    # 5. Optimal Buy Timing & Entry Zone Identification
     # Identify projected dip / trough in the median trajectory within next 3 months
     min_median_idx = int(np.argmin(p50_median[:40]))  # Look within the first ~2 months for entry
     min_median_price = float(p50_median[min_median_idx])
@@ -697,39 +748,109 @@ def predict_future_buy_timing(
     key_support = max(recent_low_60d, bb_lower, min(sma50, current_price * 0.96))
     resistance = max(bb_upper, float(df["close"].tail(60).max()), current_price * 1.05)
 
-    # Check current overbought/oversold condition
-    if current_rsi < 35 or pct_b < 0.15:
-        recommendation = "STRONG BUY"
-        action_summary = "Stock is currently oversold near major technical support. Immediate entry recommended."
-        entry_low = current_price * 0.985
-        entry_high = current_price * 1.01
-        opt_window_start = future_dates[0]
-        opt_window_end = future_dates[min(10, forecast_days - 1)]
-    elif current_rsi > 70 or pct_b > 0.85:
-        recommendation = "BUY ON PULLBACK"
+    if microstructure and isinstance(microstructure, dict):
+        avwap_ytd = microstructure.get("avwap", {}).get("ytd", {})
+        ytd_lower = avwap_ytd.get("lower_1s")
+        ytd_upper = avwap_ytd.get("upper_1s")
+
+        if ytd_lower and not pd.isna(ytd_lower):
+            key_support = max(key_support, float(ytd_lower))
+        if ytd_upper and not pd.isna(ytd_upper):
+            resistance = max(resistance, float(ytd_upper))
+
+        vp = microstructure.get("volume_profile", {})
+        val = vp.get("val")
+        vah = vp.get("vah")
+        if val and not pd.isna(val) and val < current_price:
+            key_support = max(key_support, float(val))
+        if vah and not pd.isna(vah) and vah > current_price:
+            resistance = max(resistance, float(vah))
+
+    # Check regime state first, then fallback to technical RSI/Bollinger Bands
+    if regime_state == 2:
+        # High-Vol Liquidation / Risk-Off
+        recommendation = "RISK-OFF / CAPITAL PRESERVATION"
         action_summary = (
-            f"Stock is currently in short-term overbought territory (RSI {current_rsi:.1f}). "
-            f"Wait for a pullback toward the projected support zone before deploying capital."
+            f"Active High-Volatility Liquidation Regime (BOCD State 2, {cp_hazard_pct:.1f}% hazard). "
+            f"Capital preservation is paramount. Delay large allocations until volatility structure normalizes."
         )
-        entry_low = round(min(key_support, current_price * 0.94), 2)
-        entry_high = round(current_price * 0.975, 2)
-        dip_center = max(5, min_median_idx)
-        opt_window_start = future_dates[max(0, dip_center - 5)]
-        opt_window_end = future_dates[min(forecast_days - 1, dip_center + 7)]
-    elif current_price > sma50 and sma50 > sma200:
-        recommendation = "ACCUMULATE / DIP BUY"
-        action_summary = "Healthy uptrend in place above major moving averages. Accumulate on any shallow dip."
-        entry_low = round(max(key_support, current_price * 0.96), 2)
-        entry_high = round(current_price * 0.995, 2)
-        opt_window_start = future_dates[2]
-        opt_window_end = future_dates[min(20, forecast_days - 1)]
-    else:
-        recommendation = "HOLD / CAUTIOUS BUY"
-        action_summary = "Consolidation phase. Accumulate cautiously near tested support levels."
+        entry_low = round(min(key_support * 0.94, current_price * 0.90), 2)
+        entry_high = round(min(key_support * 0.98, current_price * 0.94), 2)
+        # Delay entry window to allow liquidation phase to complete
+        opt_window_start = future_dates[min(15, forecast_days - 1)]
+        opt_window_end = future_dates[min(35, forecast_days - 1)]
+    elif regime_state == 3 or (cp_hazard_pct is not None and cp_hazard_pct >= 35.0):
+        # Regime Transition / Inflection Alert
+        recommendation = "REGIME SHIFT ALERT / PAUSE ENTRIES"
+        action_summary = (
+            f"Bayesian changepoint alert active ({cp_hazard_pct:.1f}% instant hazard). "
+            f"Market structure is in an inflection phase; pause new entries until run-length stabilizes."
+        )
+        entry_low = round(min(key_support * 0.96, current_price * 0.93), 2)
+        entry_high = round(min(key_support * 0.99, current_price * 0.96), 2)
+        opt_window_start = future_dates[min(10, forecast_days - 1)]
+        opt_window_end = future_dates[min(25, forecast_days - 1)]
+    elif regime_state == 0:
+        # Low-Vol Trending Bull
+        if current_rsi > 70 or pct_b > 0.85:
+            recommendation = "BUY ON PULLBACK"
+            action_summary = (
+                f"Bull trend active (BOCD State 0), but short-term overbought (RSI {current_rsi:.1f}). "
+                f"Wait for shallow pullback toward support before adding exposure."
+            )
+            entry_low = round(max(key_support, current_price * 0.96), 2)
+            entry_high = round(current_price * 0.985, 2)
+            opt_window_start = future_dates[min(3, forecast_days - 1)]
+            opt_window_end = future_dates[min(15, forecast_days - 1)]
+        else:
+            recommendation = "STRONG BUY / TREND ACCUMULATION"
+            action_summary = "Low-volatility expansion with supportive macro liquidity (BOCD State 0). Accumulate with high confidence."
+            entry_low = round(current_price * 0.98, 2)
+            entry_high = round(current_price * 1.01, 2)
+            opt_window_start = future_dates[0]
+            opt_window_end = future_dates[min(12, forecast_days - 1)]
+    elif regime_state == 1:
+        # Mean-Reverting Choppy Neutral
+        recommendation = "RANGE ACCUMULATION / BUY SUPPORT"
+        action_summary = "Range-bound consolidation regime (BOCD State 1). Accumulate near support and trim near resistance."
         entry_low = round(key_support * 0.98, 2)
         entry_high = round(key_support * 1.02, 2)
         opt_window_start = future_dates[5]
-        opt_window_end = future_dates[min(25, forecast_days - 1)]
+        opt_window_end = future_dates[min(20, forecast_days - 1)]
+    else:
+        # Fallback technical rules when regime is not provided
+        if current_rsi < 35 or pct_b < 0.15:
+            recommendation = "STRONG BUY"
+            action_summary = "Stock is currently oversold near major technical support. Immediate entry recommended."
+            entry_low = current_price * 0.985
+            entry_high = current_price * 1.01
+            opt_window_start = future_dates[0]
+            opt_window_end = future_dates[min(10, forecast_days - 1)]
+        elif current_rsi > 70 or pct_b > 0.85:
+            recommendation = "BUY ON PULLBACK"
+            action_summary = (
+                f"Stock is currently in short-term overbought territory (RSI {current_rsi:.1f}). "
+                f"Wait for a pullback toward the projected support zone before deploying capital."
+            )
+            entry_low = round(min(key_support, current_price * 0.94), 2)
+            entry_high = round(current_price * 0.975, 2)
+            dip_center = max(5, min_median_idx)
+            opt_window_start = future_dates[max(0, dip_center - 5)]
+            opt_window_end = future_dates[min(forecast_days - 1, dip_center + 7)]
+        elif current_price > sma50 and sma50 > sma200:
+            recommendation = "ACCUMULATE / DIP BUY"
+            action_summary = "Healthy uptrend in place above major moving averages. Accumulate on any shallow dip."
+            entry_low = round(max(key_support, current_price * 0.96), 2)
+            entry_high = round(current_price * 0.995, 2)
+            opt_window_start = future_dates[2]
+            opt_window_end = future_dates[min(20, forecast_days - 1)]
+        else:
+            recommendation = "HOLD / CAUTIOUS BUY"
+            action_summary = "Consolidation phase. Accumulate cautiously near tested support levels."
+            entry_low = round(key_support * 0.98, 2)
+            entry_high = round(key_support * 1.02, 2)
+            opt_window_start = future_dates[5]
+            opt_window_end = future_dates[min(25, forecast_days - 1)]
 
     target_price_3m = round(float(p50_median[-1]), 2)
     expected_gain_pct = round(((target_price_3m - current_price) / current_price) * 100.0, 2)
@@ -770,6 +891,11 @@ def predict_future_buy_timing(
         "risk_reward_ratio": risk_reward,
         "forecast_days": forecast_days,
         "forecast_series": forecast_points,
+        "bocd_regime_state": regime_state,
+        "bocd_regime_name": regime_name,
+        "bocd_changepoint_hazard_pct": cp_hazard_pct,
+        "bocd_forward_changepoint_prob_pct": round(forward_cp_prob, 1) if forward_cp_prob is not None else None,
+        "bocd_expected_run_length_days": round(exp_run_length, 1) if regime else None,
     }
 
 
@@ -780,6 +906,8 @@ def predict_future_buy_timing(
 def compute_multi_period_projections(
     df: pd.DataFrame,
     horizons: Optional[Dict[str, int]] = None,
+    regime: Optional[Dict[str, Any]] = None,
+    microstructure: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Project future returns over multiple investment horizons:
@@ -788,12 +916,20 @@ def compute_multi_period_projections(
     - 2 Years (~504 trading days)
     - 3 Years (~756 trading days)
 
+    Dynamically conditions forward drift and volatility on:
+    - Bayesian Online Changepoint Detection (BOCD) regime risk multipliers
+    - Multi-horizon realized volatility surfaces (21d vol vs 5d inversion)
+    - Anchored VWAP (AVWAP) standardized Z-score mean-reversion adjustments
+    - Volume Profile liquidity void dispersion expansion
+    - Cumulative forward changepoint hazard probability per horizon
+
     For each horizon, calculates:
-    - Expected Projected Return (%)
-    - Projected Annualized Return (CAGR %)
-    - Base Target Price, Bull Target Price (90th percentile), Bear Target Price (10th percentile)
-    - Probability Score (% chance of achieving positive return)
-    - Qualitative Confidence Level (e.g. High, Moderate)
+    - Expected Projected Return (%) & Projected CAGR (%)
+    - Base Target Price (p50), Bull Target Price (p90), Bear Target Price (p10)
+    - Probability Score (% chance of positive return via Gaussian erf)
+    - Qualitative Confidence Level
+    - Conditioned effective drift and volatility
+    - Forward BOCD Changepoint Hazard Probability (%)
     """
     if horizons is None:
         horizons = {
@@ -814,8 +950,7 @@ def compute_multi_period_projections(
     daily_vol = float(daily_returns.std()) if len(daily_returns) > 1 else 0.015
     ann_vol = daily_vol * math.sqrt(252)
 
-    # Estimate expected annual drift:
-    # Blend long-term CAGR with 1Y momentum and modest shrinkage toward long-term equity baseline (10%)
+    # Estimate baseline secular drift:
     total_days = len(df)
     if total_days >= 756:  # >= 3 years
         years = total_days / 252.0
@@ -829,11 +964,43 @@ def compute_multi_period_projections(
     lookback = min(252, len(daily_returns))
     recent_annualized = float(daily_returns.tail(lookback).mean() * 252)
 
-    # Blended drift
+    # Baseline secular blended drift
     raw_drift = 0.50 * cagr_historical + 0.35 * recent_annualized + 0.15 * 0.10
-    # Bound drift to realistic long-term boundaries (-15% to +35%)
-    expected_annual_drift = max(-0.15, min(0.35, raw_drift))
-    ann_vol_clamped = max(0.12, min(0.65, ann_vol))
+    base_annual_drift = max(-0.15, min(0.35, raw_drift))
+
+    # 1. Parse Regime Conditioning Factors
+    regime_risk_mult = 1.0
+    regime_vol_override = None
+    vol_inversion_penalty = 0.0
+    regime_state_name = None
+    regime_state = None
+    exp_run_length = 63.0
+
+    if regime and isinstance(regime, dict):
+        regime_state = regime.get("state")
+        regime_state_name = regime.get("name", "Unknown")
+        regime_risk_mult = float(regime.get("risk_multiplier", 1.0))
+        exp_run_length = float(regime.get("expected_run_length_days", 63.0))
+        vol_21d_pct = regime.get("vol_21d_pct")
+        if vol_21d_pct is not None and vol_21d_pct > 0:
+            regime_vol_override = float(vol_21d_pct) / 100.0
+
+        vol_ratio = float(regime.get("vol_ratio", 1.0))
+        if vol_ratio > 1.15:
+            # Volatility surface inversion (short-term stress) adds temporary dispersion
+            vol_inversion_penalty = 0.03
+
+    # Daily hazard rate for BOCD forward changepoint probability
+    h_daily = 1.0 / max(10.0, exp_run_length)
+
+    # 2. Parse Microstructure (AVWAP & Volume Profile) Factors
+    avwap_z = None
+    in_liquidity_void = False
+    if microstructure and isinstance(microstructure, dict):
+        avwap_ytd = microstructure.get("avwap", {}).get("ytd", {})
+        avwap_z = avwap_ytd.get("zscore")
+        vp = microstructure.get("volume_profile", {})
+        in_liquidity_void = bool(vp.get("in_liquidity_void", False))
 
     results = {}
     horizon_labels = {
@@ -845,9 +1012,45 @@ def compute_multi_period_projections(
 
     for key, days in horizons.items():
         t = days / 252.0  # Time in years
+
+        # Horizon decay: Near-term horizons (6M, 1Y) are heavily influenced by current regime
+        # and AVWAP extension; longer horizons (2Y, 3Y) gradually revert to long-term secular growth
+        w_regime = math.exp(-0.75 * t)  # 6M: ~0.69, 1Y: ~0.47, 2Y: ~0.22, 3Y: ~0.10
+
+        # Adjust drift based on regime risk multiplier
+        effective_drift = base_annual_drift * (1.0 - w_regime * (1.0 - regime_risk_mult))
+
+        # Adjust drift based on AVWAP Z-score (mean-reversion pull vs discount accumulation)
+        delta_avwap = 0.0
+        if avwap_z is not None:
+            if avwap_z > 2.0:
+                # Overbought extension above YTD AVWAP faces mean-reversion drag
+                delta_avwap = -0.04 * w_regime
+            elif -1.5 <= avwap_z < 0.0:
+                # Institutional discount zone provides rebound support
+                delta_avwap = 0.02 * w_regime
+            elif avwap_z < -2.0:
+                # Severe structural liquidation breakdown
+                delta_avwap = -0.03 * w_regime
+        effective_drift += delta_avwap
+        effective_drift = max(-0.25, min(0.35, effective_drift))
+
+        # Effective volatility
+        if regime_vol_override is not None:
+            # Blend long-term vol with current regime realized vol surface
+            horizon_vol = (1.0 - w_regime * 0.70) * ann_vol + (w_regime * 0.70) * regime_vol_override
+        else:
+            horizon_vol = ann_vol
+
+        horizon_vol += vol_inversion_penalty * w_regime
+        if in_liquidity_void:
+            horizon_vol *= (1.0 + 0.15 * w_regime)  # Thin market depth expands dispersion
+
+        ann_vol_clamped = max(0.12, min(0.70, horizon_vol))
+
         # Geometric Brownian Motion log-normal parameters
         # ln(S_t / S_0) ~ Normal((mu - 0.5 * sigma^2) * t, sigma^2 * t)
-        mu_log = (expected_annual_drift - 0.5 * (ann_vol_clamped ** 2)) * t
+        mu_log = (effective_drift - 0.5 * (ann_vol_clamped ** 2)) * t
         sigma_log = ann_vol_clamped * math.sqrt(t)
 
         # Median Base Target Price (p50)
@@ -882,6 +1085,11 @@ def compute_multi_period_projections(
             confidence = "Downside Risk"
             conf_color = "red"
 
+        # Forward BOCD changepoint hazard probability over this horizon
+        cp_prob_horizon = None
+        if regime and isinstance(regime, dict):
+            cp_prob_horizon = round((1.0 - (1.0 - h_daily) ** days) * 100.0, 1)
+
         results[key] = {
             "key": key,
             "label": horizon_labels.get(key, key),
@@ -895,6 +1103,13 @@ def compute_multi_period_projections(
             "probability_score": prob_score,
             "confidence": confidence,
             "conf_color": conf_color,
+            "effective_drift_pct": round(effective_drift * 100.0, 1),
+            "effective_vol_pct": round(ann_vol_clamped * 100.0, 1),
+            "regime_conditioned": regime is not None,
+            "microstructure_conditioned": microstructure is not None,
+            "bocd_changepoint_prob_pct": cp_prob_horizon,
+            "regime_state": regime_state,
+            "regime_name": regime_state_name,
         }
 
     return results
@@ -994,11 +1209,29 @@ def run_stock_analysis(
     regime_summary, df_enriched = detect_market_regime(df, data_dir=data_dir, symbol=symbol)
     df = df_enriched
 
-    # 2. Performance, buy timing, and forward projections
+    # 2. Institutional Microstructure (AVWAP & Volume Profile KDE)
+    micro_summary = None
+    if compute_microstructure_features is not None and not df.empty:
+        try:
+            df_micro, micro_summary = compute_microstructure_features(df)
+            df = df_micro
+        except Exception as e:
+            logger.warning(f"Microstructure analysis encountered an exception: {e}")
+
+    # 3. Performance, buy timing, and forward projections
     perf_summary = compute_performance_summary(df, periods_years=[1, 3, 5])
     best_buys = detect_historical_best_buys(df, periods_years=[1, 3, 5])
-    predictive = predict_future_buy_timing(df, forecast_days=forecast_days)
-    projections = compute_multi_period_projections(df)
+    predictive = predict_future_buy_timing(
+        df,
+        forecast_days=forecast_days,
+        regime=regime_summary,
+        microstructure=micro_summary,
+    )
+    projections = compute_multi_period_projections(
+        df,
+        regime=regime_summary,
+        microstructure=micro_summary,
+    )
 
     return {
         "symbol": symbol.upper(),
@@ -1013,5 +1246,6 @@ def run_stock_analysis(
         "predictive": predictive,
         "projections": projections,
         "regime": regime_summary,
+        "microstructure": micro_summary,
     }
 

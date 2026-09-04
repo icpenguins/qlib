@@ -294,6 +294,87 @@ class TestStockAnalysisEngine(unittest.TestCase):
             self.assertEqual(analysis["latest_data_date"], max_date)
             self.assertEqual(analysis["request_date"], max_date)
 
+    def test_predict_future_buy_timing_with_bocd(self):
+        """Test that predict_future_buy_timing correctly integrates BOCD regime states and hazard."""
+        regime_risk_off = {
+            "state": 2,
+            "name": "High-Vol Liquidation / Risk-Off",
+            "changepoint_prob_pct": 32.5,
+            "expected_run_length_days": 25.0,
+            "vol_21d_pct": 38.0,
+            "vol_ratio": 1.25,
+            "risk_multiplier": 0.4,
+        }
+        pred_risk_off = predict_future_buy_timing(
+            self.df_synthetic,
+            forecast_days=63,
+            regime=regime_risk_off,
+        )
+        self.assertEqual(pred_risk_off["recommendation"], "RISK-OFF / CAPITAL PRESERVATION")
+        self.assertIn("BOCD State 2", pred_risk_off["action_summary"])
+        self.assertEqual(pred_risk_off["bocd_regime_state"], 2)
+        self.assertEqual(pred_risk_off["bocd_regime_name"], "High-Vol Liquidation / Risk-Off")
+        self.assertIsNotNone(pred_risk_off["bocd_forward_changepoint_prob_pct"])
+        self.assertGreater(pred_risk_off["bocd_forward_changepoint_prob_pct"], 50.0)
+
+        # Bull Regime test
+        regime_bull = {
+            "state": 0,
+            "name": "Low-Vol Trending Bull",
+            "changepoint_prob_pct": 2.1,
+            "expected_run_length_days": 80.0,
+            "vol_21d_pct": 14.0,
+            "vol_ratio": 0.85,
+            "risk_multiplier": 1.0,
+        }
+        pred_bull = predict_future_buy_timing(
+            self.df_synthetic,
+            forecast_days=63,
+            regime=regime_bull,
+        )
+        self.assertEqual(pred_bull["recommendation"], "STRONG BUY / TREND ACCUMULATION")
+        self.assertEqual(pred_bull["bocd_regime_state"], 0)
+
+    def test_multi_period_projections_conditioned(self):
+        """Test multi-period projections dynamically conditioned on BOCD regime, vol surface, and AVWAP."""
+        uncond = compute_multi_period_projections(self.df_synthetic)
+        
+        regime_risk_off = {
+            "state": 2,
+            "name": "High-Vol Liquidation / Risk-Off",
+            "changepoint_prob_pct": 25.0,
+            "expected_run_length_days": 30.0,
+            "vol_21d_pct": 40.0,
+            "vol_ratio": 1.20,
+            "risk_multiplier": 0.4,
+        }
+        cond_risk_off = compute_multi_period_projections(
+            self.df_synthetic,
+            regime=regime_risk_off,
+        )
+
+        # 6M projection under Risk-Off should have lower return and lower confidence score
+        self.assertLess(
+            cond_risk_off["6M"]["projected_return_pct"],
+            uncond["6M"]["projected_return_pct"],
+        )
+        self.assertLess(
+            cond_risk_off["6M"]["probability_score"],
+            uncond["6M"]["probability_score"],
+        )
+        self.assertTrue(cond_risk_off["6M"]["regime_conditioned"])
+
+        # Forward changepoint probability should increase with horizon length
+        self.assertIsNotNone(cond_risk_off["6M"]["bocd_changepoint_prob_pct"])
+        self.assertLessEqual(
+            cond_risk_off["6M"]["bocd_changepoint_prob_pct"],
+            cond_risk_off["1Y"]["bocd_changepoint_prob_pct"],
+        )
+        self.assertLessEqual(
+            cond_risk_off["1Y"]["bocd_changepoint_prob_pct"],
+            cond_risk_off["3Y"]["bocd_changepoint_prob_pct"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

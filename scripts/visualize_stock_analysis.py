@@ -112,21 +112,32 @@ def generate_html_dashboard(
             "volume": int(row["volume"]) if not pd.isna(row["volume"]) else 0,
             "sma50": round(float(row["sma50"]), 2) if not pd.isna(row.get("sma50")) else None,
             "sma200": round(float(row["sma200"]), 2) if not pd.isna(row.get("sma200")) else None,
+            "avwap_ytd": round(float(row["avwap_ytd"]), 2) if "avwap_ytd" in row and not pd.isna(row["avwap_ytd"]) else None,
+            "avwap_ytd_upper_1s": round(float(row["avwap_ytd_upper_1s"]), 2) if "avwap_ytd_upper_1s" in row and not pd.isna(row["avwap_ytd_upper_1s"]) else None,
+            "avwap_ytd_lower_1s": round(float(row["avwap_ytd_lower_1s"]), 2) if "avwap_ytd_lower_1s" in row and not pd.isna(row["avwap_ytd_lower_1s"]) else None,
         })
 
     # Color palette based on recommendation
     rec_colors = {
         "STRONG BUY": ("#10b981", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"),
+        "STRONG BUY / TREND ACCUMULATION": ("#10b981", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"),
         "BUY ON PULLBACK": ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"),
         "ACCUMULATE / DIP BUY": ("#06b6d4", "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"),
+        "RANGE ACCUMULATION / BUY SUPPORT": ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"),
         "HOLD / CAUTIOUS BUY": ("#f59e0b", "bg-amber-500/10 text-amber-400 border-amber-500/30"),
+        "REGIME SHIFT ALERT / PAUSE ENTRIES": ("#f59e0b", "bg-amber-500/10 text-amber-400 border-amber-500/30"),
+        "RISK-OFF / CAPITAL PRESERVATION": ("#ef4444", "bg-red-500/10 text-red-400 border-red-500/30"),
     }
     rec_color, rec_badge_class = rec_colors.get(pred["recommendation"], ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"))
 
     # Multi-period forward projections (6M, 1Y, 2Y, 3Y)
     projections = analysis_data.get("projections")
     if not projections:
-        projections = compute_multi_period_projections(df)
+        projections = compute_multi_period_projections(
+            df,
+            regime=analysis_data.get("regime"),
+            microstructure=analysis_data.get("microstructure"),
+        )
 
     # Build projection cards HTML for 6M, 1Y, 2Y, 3Y
     proj_cards_html = ""
@@ -195,6 +206,14 @@ def generate_html_dashboard(
               <span>Confidence:</span>
               <span class="{conf_text_color} font-medium">{conf}</span>
             </div>
+            <div class="flex justify-between text-gray-500 text-[10px] pt-0.5">
+              <span>Conditioned &mu; / &sigma;:</span>
+              <span class="font-mono text-gray-400">{p_data.get('effective_drift_pct', 0.0):+.1f}% / {p_data.get('effective_vol_pct', 0.0):.1f}%</span>
+            </div>
+            {f'''<div class="flex justify-between text-gray-500 text-[10px]">
+              <span>BOCD Shift Risk:</span>
+              <span class="font-mono text-purple-300 font-semibold">{p_data.get("bocd_changepoint_prob_pct"):.0f}%</span>
+            </div>''' if p_data.get("bocd_changepoint_prob_pct") is not None else ''}
           </div>
         </div>
         """
@@ -301,6 +320,131 @@ def generate_html_dashboard(
     </div>
     """
 
+    # Build institutional microstructure & AVWAP HTML if available
+    micro = analysis_data.get("microstructure")
+    micro_html = ""
+    if micro:
+        avwap_data = micro.get("avwap", {})
+        ytd = avwap_data.get("ytd", {})
+        h52 = avwap_data.get("high_52w", {})
+        l52 = avwap_data.get("low_52w", {})
+        vp = micro.get("volume_profile", {})
+
+        ytd_val = ytd.get("value")
+        ytd_str = f"${ytd_val:.2f}" if ytd_val is not None else "N/A"
+        ytd_z = ytd.get("zscore")
+        ytd_z_str = f"{ytd_z:+.2f}σ" if ytd_z is not None else "N/A"
+        ytd_z_color = "text-emerald-400" if (ytd_z is not None and 0 <= ytd_z <= 1.5) else ("text-cyan-400" if (ytd_z is not None and -1.5 <= ytd_z < 0) else "text-amber-400")
+
+        h52_val = h52.get("value")
+        h52_str = f"${h52_val:.2f}" if h52_val is not None else "N/A"
+        l52_val = l52.get("value")
+        l52_str = f"${l52_val:.2f}" if l52_val is not None else "N/A"
+
+        poc_val = vp.get("poc")
+        poc_str = f"${poc_val:.2f}" if poc_val is not None else "N/A"
+        vah_val = vp.get("vah")
+        vah_str = f"${vah_val:.2f}" if vah_val is not None else "N/A"
+        val_val = vp.get("val")
+        val_str = f"${val_val:.2f}" if val_val is not None else "N/A"
+
+        void_status = vp.get("void_status", "Balanced Liquidity")
+        void_badge = "bg-amber-500/10 text-amber-400 border-amber-500/30" if vp.get("in_liquidity_void") else "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"
+
+        micro_html = f"""
+    <!-- INSTITUTIONAL LIQUIDITY, ANCHORED VWAP & VOLUME PROFILE ROW -->
+    <div class="bg-gray-950/70 border border-cyan-900/40 rounded-2xl p-5 shadow-sm">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse"></span>
+          <h2 class="text-xs font-bold text-cyan-300 uppercase tracking-wider">Institutional Liquidity, Anchored VWAP (AVWAP) &amp; Volume Profile</h2>
+        </div>
+        <div class="text-[11px] text-gray-400 font-mono">
+          Gaussian Kernel Density Estimation (KDE) &bull; Volume-Weighted Dispersion Bands (&plusmn;1&sigma;)
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <!-- YTD AVWAP CARD -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">YTD Anchored VWAP</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-cyan-500/10 text-cyan-400 border-cyan-500/30 font-mono">{ytd.get('date', 'N/A')}</span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              {ytd_str} <span class="text-xs font-bold font-mono {ytd_z_color}">{ytd_z_str}</span>
+            </div>
+            <div class="text-[11px] text-gray-400 mt-1">
+              &plusmn;1&sigma; Envelope: <span class="font-mono text-gray-200">${ytd.get('lower_1s', 0) if ytd.get('lower_1s') is not None else 0:.2f} &ndash; ${ytd.get('upper_1s', 0) if ytd.get('upper_1s') is not None else 0:.2f}</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
+            {ytd.get('action', '')}
+          </div>
+        </div>
+
+        <!-- 52-WEEK HIGH / LOW ANCHORS -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Cyclical AVWAP Anchors</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-purple-500/10 text-purple-400 border-purple-500/30">52W Extremes</span>
+            </div>
+            <div class="space-y-1.5 mt-1">
+              <div class="flex justify-between text-xs">
+                <span class="text-gray-400">52W High ({h52.get('date', 'N/A')}):</span>
+                <span class="font-bold text-white font-mono">{h52_str} <span class="text-[10px] text-gray-400">({'+' if (h52.get('spread_pct') or 0) >= 0 else ''}{h52.get('spread_pct', 0):.1f}%)</span></span>
+              </div>
+              <div class="flex justify-between text-xs">
+                <span class="text-gray-400">52W Low ({l52.get('date', 'N/A')}):</span>
+                <span class="font-bold text-white font-mono">{l52_str} <span class="text-[10px] text-gray-400">({'+' if (l52.get('spread_pct') or 0) >= 0 else ''}{l52.get('spread_pct', 0):.1f}%)</span></span>
+              </div>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-2">
+            Anchor Memory: <span class="text-gray-200 font-medium">Overhead supply from peak vs. support from trough</span>
+          </div>
+        </div>
+
+        <!-- VOLUME PROFILE POC & VALUE AREA -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Volume Profile (KDE)</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-teal-500/10 text-teal-400 border-teal-500/30">70% Value Area</span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              {poc_str} <span class="text-xs font-normal text-gray-400">Point of Control</span>
+            </div>
+            <div class="text-[11px] text-gray-400 mt-1">
+              Value Area: <span class="font-mono text-gray-200">{val_str} &ndash; {vah_str}</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-2">
+            Distance to POC: <span class="font-mono text-gray-200">{'+' if (vp.get('dist_to_poc_pct') or 0) >= 0 else ''}{vp.get('dist_to_poc_pct', 0):.1f}%</span> &bull; <span class="text-gray-200">{'Inside Value Area' if vp.get('in_value_area') else 'Outside Value Area'}</span>
+          </div>
+        </div>
+
+        <!-- LIQUIDITY VOID / DEPTH -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Market Depth &amp; Void</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {void_badge}">{'VOID DETECTED' if vp.get('in_liquidity_void') else 'BALANCED'}</span>
+            </div>
+            <div class="text-sm font-bold text-white mt-1 leading-snug">
+              {void_status}
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-2">
+            Execution Rule: <span class="text-gray-200 font-medium">{'Fast traversal through thin book' if vp.get('in_liquidity_void') else 'Sustained institutional balance'}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+
     # Convert payloads to JSON
     json_history = json.dumps(history_payload)
     json_best_buys = json.dumps(best_buys)
@@ -308,6 +452,7 @@ def generate_html_dashboard(
     json_performance = json.dumps(perf)
     json_projections = json.dumps(projections)
     json_regime = json.dumps(regime) if regime else "{}"
+    json_micro = json.dumps(micro) if micro else "{}"
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -470,11 +615,15 @@ def generate_html_dashboard(
           <div class="flex justify-between"><span class="text-gray-500">Optimal Window:</span> <span class="text-emerald-300 font-medium">{pred['optimal_buy_window']['start_date']} &rarr; {pred['optimal_buy_window']['end_date']}</span></div>
           <div class="flex justify-between"><span class="text-gray-500">Stop-Loss:</span> <span class="text-red-400 font-medium">${pred['stop_loss']:.2f}</span></div>
           <div class="flex justify-between"><span class="text-gray-500">Key Support:</span> <span class="text-gray-300 font-medium">${pred['key_support']:.2f}</span></div>
+          {f'''<div class="flex justify-between"><span class="text-gray-500">BOCD Regime:</span> <span class="text-amber-300 font-medium">{pred.get("bocd_regime_name")}</span></div>''' if pred.get("bocd_regime_name") else ''}
+          {f'''<div class="flex justify-between"><span class="text-gray-500">63d Changepoint Risk:</span> <span class="text-red-400 font-mono font-medium">{pred.get("bocd_forward_changepoint_prob_pct"):.1f}%</span></div>''' if pred.get("bocd_forward_changepoint_prob_pct") is not None else ''}
         </div>
       </div>
     </div>
 
     {regime_html}
+
+    {micro_html}
 
     <!-- FORWARD RETURN PROJECTIONS & PROBABILITY SCORES ROW -->
     <div class="bg-gray-950/60 border border-purple-900/30 rounded-2xl p-5 shadow-sm">
@@ -483,7 +632,7 @@ def generate_html_dashboard(
           <span class="w-2.5 h-2.5 rounded-full bg-purple-400 animate-pulse"></span>
           <h2 class="text-xs font-bold text-purple-300 uppercase tracking-wider">Forward Return Projections &amp; Probability Analysis</h2>
         </div>
-        <span class="text-[11px] text-gray-400 font-medium">Statistical drift &amp; Monte Carlo probability distributions (6M, 1Y, 2Y, 3Y)</span>
+        <span class="text-[11px] text-gray-400 font-medium">Dynamically conditioned on BOCD regime risk, hazard probabilities &amp; microstructure</span>
       </div>
       <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
         {proj_cards_html}
@@ -549,6 +698,7 @@ def generate_html_dashboard(
           <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-blue-500 inline-block"></span> Close Price</span>
           <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-amber-400 inline-block"></span> 50-Day MA</span>
           <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-purple-400 inline-block"></span> 200-Day MA</span>
+          <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-cyan-400 inline-block"></span> YTD AVWAP (&plusmn;1&sigma;)</span>
           <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-amber-400 inline-block"></span> Best Buy Point</span>
           <span class="flex items-center gap-1.5"><span class="w-3.5 h-2 bg-emerald-500/25 border border-emerald-500/50 inline-block"></span> Subsequent Rally Window</span>
         </div>
@@ -574,15 +724,19 @@ def generate_html_dashboard(
     <div class="bg-gray-900 border border-gray-800 rounded-2xl p-6 shadow-xl">
       <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-3">
         <div>
-          <h2 class="text-lg font-bold text-white flex items-center gap-2">
-            <span>3-Month Predictive Buy Analysis</span>
-            <span class="text-xs px-2 py-0.5 rounded font-bold {rec_badge_class}">{pred['recommendation']}</span>
-          </h2>
+          <div class="flex flex-wrap items-center gap-2 mb-1">
+            <h2 class="text-lg font-bold text-white">3-Month Predictive Buy Analysis</h2>
+            <span class="text-xs px-2.5 py-0.5 rounded-full font-bold border {rec_badge_class}">{pred['recommendation']}</span>
+            {f'''<span class="text-xs px-2.5 py-0.5 rounded-full font-semibold border bg-purple-500/10 text-purple-300 border-purple-500/30">BOCD: {pred.get("bocd_regime_name")}</span>''' if pred.get("bocd_regime_name") else ''}
+          </div>
           <p class="text-xs text-gray-400">
-            Monte Carlo path simulation with trend-reversion channels projecting 63 trading days forward from {perf['latest_date']}.
+            BOCD jump-diffusion Monte Carlo path simulation with trend channels projecting 63 trading days forward from {perf['latest_date']}.
           </p>
         </div>
-        <div class="flex items-center gap-4 text-xs">
+        <div class="flex flex-wrap items-center gap-3 text-xs">
+          {f'''<div class="bg-purple-950/40 border border-purple-800/40 px-3 py-1.5 rounded-lg text-purple-300">
+            <span class="text-gray-400">63d Changepoint Risk:</span> <strong>{pred.get("bocd_forward_changepoint_prob_pct"):.1f}%</strong>
+          </div>''' if pred.get("bocd_forward_changepoint_prob_pct") is not None else ''}
           <div class="bg-emerald-950/40 border border-emerald-800/40 px-3 py-1.5 rounded-lg text-emerald-300">
             <span class="text-gray-400">Optimal Window:</span> <strong>{pred['optimal_buy_window']['start_date']} &rarr; {pred['optimal_buy_window']['end_date']}</strong>
           </div>
@@ -974,12 +1128,16 @@ def generate_html_dashboard(
       const prices = filteredHistory.map(d => d.close);
       const sma50 = filteredHistory.map(d => (d.sma50 !== undefined ? d.sma50 : null));
       const sma200 = filteredHistory.map(d => (d.sma200 !== undefined ? d.sma200 : null));
+      const avwapYtd = filteredHistory.map(d => (d.avwap_ytd !== undefined ? d.avwap_ytd : null));
+      const avwapUpper = filteredHistory.map(d => (d.avwap_ytd_upper_1s !== undefined ? d.avwap_ytd_upper_1s : null));
+      const avwapLower = filteredHistory.map(d => (d.avwap_ytd_lower_1s !== undefined ? d.avwap_ytd_lower_1s : null));
 
       // Calculate minPrice and maxPrice considering visible prices and MAs to avoid clipping
       const allVisibleValues = [
         ...prices,
         ...sma50.filter(v => v !== null && v !== undefined),
         ...sma200.filter(v => v !== null && v !== undefined),
+        ...avwapYtd.filter(v => v !== null && v !== undefined),
       ];
       const minPrice = (allVisibleValues.length > 0 ? Math.min(...allVisibleValues) : 10) * 0.94;
       const maxPrice = (allVisibleValues.length > 0 ? Math.max(...allVisibleValues) : 100) * 1.06;
@@ -1056,6 +1214,41 @@ def generate_html_dashboard(
           const x = getX(i);
           const y = getY(sma50[i]);
           if (!started) {{ ctx.moveTo(x, y); started = true; }} else {{ ctx.lineTo(x, y); }}
+        }}
+      }}
+      ctx.stroke();
+
+      // Draw YTD AVWAP & +/-1 sigma envelope
+      let startedChannel = false;
+      ctx.fillStyle = 'rgba(6, 182, 212, 0.08)';
+      ctx.beginPath();
+      for (let i = 0; i < avwapUpper.length; i++) {{
+        if (avwapUpper[i] !== null && avwapLower[i] !== null) {{
+          const x = getX(i);
+          const y = getY(avwapUpper[i]);
+          if (!startedChannel) {{ ctx.moveTo(x, y); startedChannel = true; }} else {{ ctx.lineTo(x, y); }}
+        }}
+      }}
+      for (let i = avwapLower.length - 1; i >= 0; i--) {{
+        if (avwapUpper[i] !== null && avwapLower[i] !== null) {{
+          const x = getX(i);
+          const y = getY(avwapLower[i]);
+          ctx.lineTo(x, y);
+        }}
+      }}
+      ctx.closePath();
+      if (startedChannel) ctx.fill();
+
+      // YTD AVWAP Line
+      ctx.strokeStyle = '#06b6d4';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      let startedAvwap = false;
+      for (let i = 0; i < avwapYtd.length; i++) {{
+        if (avwapYtd[i] !== null) {{
+          const x = getX(i);
+          const y = getY(avwapYtd[i]);
+          if (!startedAvwap) {{ ctx.moveTo(x, y); startedAvwap = true; }} else {{ ctx.lineTo(x, y); }}
         }}
       }}
       ctx.stroke();
@@ -1230,6 +1423,7 @@ def generate_html_dashboard(
         <div class="text-blue-400 font-semibold">Close: $${{d.close.toFixed(2)}}</div>
         ${{d.sma50 !== null && d.sma50 !== undefined ? `<div class="text-amber-400 text-xs font-medium mt-0.5">50 MA: $${{Number(d.sma50).toFixed(2)}}</div>` : ''}}
         ${{d.sma200 !== null && d.sma200 !== undefined ? `<div class="text-purple-400 text-xs font-medium mt-0.5">200 MA: $${{Number(d.sma200).toFixed(2)}}</div>` : ''}}
+        ${{d.avwap_ytd !== null && d.avwap_ytd !== undefined ? `<div class="text-cyan-400 text-xs font-medium mt-0.5">YTD AVWAP: $${{Number(d.avwap_ytd).toFixed(2)}}</div>` : ''}}
       `;
       if (nearBuy) {{
         tooltipHtml += `
@@ -1673,6 +1867,22 @@ def main():
         print(f"Volatility Surface: 21d Vol: {regime['vol_21d_pct']}% | Term Ratio (5d/21d): {regime['vol_ratio']}x")
         print(f"Macro Risk Sizing:  {regime['risk_multiplier']}x exposure (Credit momentum: {regime['credit_mom_pct']:+.2f}%)")
 
+    micro = analysis_data.get("microstructure")
+    if micro:
+        av = micro.get("avwap", {})
+        ytd_info = av.get("ytd", {})
+        vp_info = micro.get("volume_profile", {})
+        print("\n-------------------------------------------------------")
+        print(" INSTITUTIONAL LIQUIDITY, AVWAP & VOLUME PROFILE (KDE)")
+        print("-------------------------------------------------------")
+        if ytd_info.get("value") is not None:
+            print(f"YTD Anchored VWAP:  ${ytd_info['value']:.2f} ({ytd_info.get('spread_pct', 0):+.1f}%, {ytd_info.get('zscore', 0):+.2f}s)")
+            print(f"AVWAP +/-1s Envelope: ${ytd_info.get('lower_1s', 0):.2f} - ${ytd_info.get('upper_1s', 0):.2f}")
+        if vp_info.get("poc") is not None:
+            print(f"Volume Profile POC: ${vp_info['poc']:.2f} ({vp_info.get('dist_to_poc_pct', 0):+.1f}% from close)")
+            print(f"70% Value Area:     ${vp_info.get('val', 0):.2f} (VAL) - ${vp_info.get('vah', 0):.2f} (VAH)")
+            print(f"Market Depth State: {vp_info.get('void_status')}")
+
     proj = analysis_data.get("projections", {})
     if proj:
         print("\n-------------------------------------------------------")
@@ -1681,12 +1891,17 @@ def main():
         for k in ["6M", "1Y", "2Y", "3Y"]:
             p_val = proj.get(k, {})
             if p_val:
-                print(f"[{p_val['label']:8s}] Expected: {p_val['projected_return_pct']:+5.1f}% | Target: ${p_val['base_target_price']:7.2f} | Range: ${p_val['bear_price']:.2f}-${p_val['bull_price']:.2f} | Prob: {p_val['probability_score']:4.1f}% ({p_val['confidence']})")
+                shift_str = f" | Shift Risk: {p_val['bocd_changepoint_prob_pct']:4.1f}%" if p_val.get('bocd_changepoint_prob_pct') is not None else ""
+                print(f"[{p_val['label']:8s}] Expected: {p_val['projected_return_pct']:+5.1f}% | Target: ${p_val['base_target_price']:7.2f} | Range: ${p_val['bear_price']:.2f}-${p_val['bull_price']:.2f} | Prob: {p_val['probability_score']:4.1f}% ({p_val['confidence']}){shift_str}")
 
     print("\n-------------------------------------------------------")
     print(" 3-MONTH PREDICTIVE BUY ANALYSIS")
     print("-------------------------------------------------------")
     print(f"Recommendation:     {pred['recommendation']}")
+    if pred.get("bocd_regime_name"):
+        cp_fwd = pred.get("bocd_forward_changepoint_prob_pct")
+        cp_fwd_str = f"{cp_fwd:.1f}%" if cp_fwd is not None else "N/A"
+        print(f"BOCD Regime:        {pred['bocd_regime_name']} (63d Changepoint Risk: {cp_fwd_str})")
     print(f"Action:             {pred['action_summary']}")
     print(f"Optimal Entry Zone: ${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}")
     print(f"Optimal Window:     {pred['optimal_buy_window']['description']}")
