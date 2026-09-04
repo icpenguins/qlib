@@ -90,9 +90,9 @@ jobs:
         run: |
           python scripts/run_all_tests.py -v
 
-      - name: Run Fast Pytest Suite
+      - name: Run Institutional Production Test Suite (Pytest)
         run: |
-          python -m pytest tests/ -m "not slow" --ignore=tests/test_all_pipeline.py
+          python -m pytest tests/test_events_pead.py tests/test_stock_analysis_engine.py tests/test_derivatives_gex.py tests/test_microstructure.py tests/test_bocd_regime.py tests/test_download_us_selected_data.py -v
 
       - name: Archive Built Wheel for PR Inspection (No Release)
         uses: actions/upload-artifact@v4
