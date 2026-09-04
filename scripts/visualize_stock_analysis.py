@@ -662,19 +662,7 @@ def generate_html_dashboard(
         degross_info = events.get("degrossing") or {}
 
         status_code = cat_info.get("status_code", "SAFE")
-        status_desc = cat_info.get("status_description", "No imminent binary event risk within 5 business days.")
-        urgency = cat_info.get("urgency_level", "NORMAL")
-        next_earn_date = cat_info.get("next_earnings_date") or events.get("next_earnings_date") or "TBD"
-        days_earn = cat_info.get("days_to_earnings") if cat_info.get("days_to_earnings") is not None else events.get("earnings_days_away")
-        next_macro_event = cat_info.get("next_macro_event", "FOMC / CPI")
-        next_macro_date = cat_info.get("next_macro_date", "TBD")
-        days_macro = cat_info.get("days_to_macro")
-
-        # Haircut & advice
-        haircut = degross_info.get("position_haircut", events.get("degross_multiplier", 1.0))
-        haircut_pct = int(haircut * 100)
-        risk_advice = degross_info.get("risk_advice", "Maintain full institutional risk budget.")
-        gap_sd = degross_info.get("binary_gap_sd", 0.0)
+        status_code = cat_info.get("status_code", "SAFE")
 
         # Status badge styling
         if status_code in ("CRITICAL_EVENT", "IMMINENT_DEGROSS"):
