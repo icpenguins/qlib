@@ -653,6 +653,239 @@ def generate_html_dashboard(
     </div>
     """
 
+    # Build Corporate Catalyst Awareness & PEAD Models Card
+    events = analysis_data.get("events")
+    events_html = ""
+    if events:
+        cat_info = events.get("catalyst_status") or events.get("catalyst") or {}
+        pead_info = events.get("pead") or {}
+        degross_info = events.get("degrossing") or {}
+
+        status_code = cat_info.get("status_code", "SAFE")
+        status_desc = cat_info.get("status_description", "No imminent binary event risk within 5 business days.")
+        urgency = cat_info.get("urgency_level", "NORMAL")
+        next_earn_date = cat_info.get("next_earnings_date") or events.get("next_earnings_date") or "TBD"
+        days_earn = cat_info.get("days_to_earnings") if cat_info.get("days_to_earnings") is not None else events.get("earnings_days_away")
+        next_macro_event = cat_info.get("next_macro_event", "FOMC / CPI")
+        next_macro_date = cat_info.get("next_macro_date", "TBD")
+        days_macro = cat_info.get("days_to_macro")
+
+        # Haircut & advice
+        haircut = degross_info.get("position_haircut", events.get("degross_multiplier", 1.0))
+        haircut_pct = int(haircut * 100)
+        risk_advice = degross_info.get("risk_advice", "Maintain full institutional risk budget.")
+        gap_sd = degross_info.get("binary_gap_sd", 0.0)
+
+        # Status badge styling
+        if status_code in ("CRITICAL_EVENT", "IMMINENT_DEGROSS"):
+            badge_cat = "bg-rose-500/10 text-rose-400 border-rose-500/30"
+            status_color = "text-rose-400"
+            pulse_color = "bg-rose-400"
+            status_label = "IMMINENT EVENT RISK / DE-GROSS"
+        elif status_code == "APPROACHING":
+            badge_cat = "bg-amber-500/10 text-amber-400 border-amber-500/30"
+            status_color = "text-amber-400"
+            pulse_color = "bg-amber-400"
+            status_label = "APPROACHING CATALYST (50% HAIRCUT)"
+        else:
+            badge_cat = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+            status_color = "text-emerald-400"
+            pulse_color = "bg-emerald-400"
+            status_label = "SAFE LIQUIDITY WINDOW"
+
+        # PEAD info
+        pead_regime = pead_info.get("drift_regime", "NEUTRAL")
+        sue = pead_info.get("sue_score", 0.0)
+        gap_pct = pead_info.get("announcement_gap_pct", 0.0)
+        drift_pct = pead_info.get("post_earnings_drift_pct", 0.0)
+        recent_earn_date = pead_info.get("recent_announcement_date", "N/A")
+
+        if "bullish" in pead_regime.lower():
+            pead_badge = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+            pead_regime_label = "Bullish Post-Earnings Drift"
+            pead_color = "text-emerald-400"
+        elif "bearish" in pead_regime.lower():
+            pead_badge = "bg-rose-500/10 text-rose-400 border-rose-500/30"
+            pead_regime_label = "Bearish Post-Earnings Drift"
+            pead_color = "text-rose-400"
+        else:
+            pead_badge = "bg-gray-800 text-gray-400 border-gray-700"
+            pead_regime_label = "Neutral Drift Regime"
+            pead_color = "text-gray-400"
+
+        # Recent Earnings History rows
+        earn_history = events.get("recent_earnings_history", [])
+        earn_rows_html = ""
+        for h in reversed(earn_history[-4:]):
+            dt = h.get("date", "N/A")
+            act = h.get("actual_eps")
+            est = h.get("estimated_eps")
+            surp = h.get("surprise_pct")
+            h_sue = h.get("sue_score")
+            h_gap = h.get("announcement_gap_pct")
+            h_drift = h.get("drift_30d_pct")
+
+            act_str = f"${act:.2f}" if act is not None else "N/A"
+            est_str = f"${est:.2f}" if est is not None else "N/A"
+            surp_str = f"{surp:+.1f}%" if surp is not None else "N/A"
+            surp_color = "text-emerald-400" if (surp and surp > 0) else ("text-rose-400" if (surp and surp < 0) else "text-gray-400")
+            sue_str = f"{h_sue:+.2f}" if h_sue is not None else "N/A"
+            gap_str = f"{h_gap:+.2f}%" if h_gap is not None else "N/A"
+            gap_color = "text-emerald-400" if (h_gap and h_gap > 0) else ("text-rose-400" if (h_gap and h_gap < 0) else "text-gray-400")
+            drift_str = f"{h_drift:+.2f}%" if h_drift is not None else "N/A"
+            drift_color = "text-emerald-400" if (h_drift and h_drift > 0) else ("text-rose-400" if (h_drift and h_drift < 0) else "text-gray-400")
+
+            tag_class = "bg-emerald-950/40 text-emerald-300 border-emerald-700/50" if (h_sue and h_sue > 0.5) else (
+                "bg-rose-950/40 text-rose-300 border-rose-700/50" if (h_sue and h_sue < -0.5) else "bg-gray-800 text-gray-300 border-gray-700"
+            )
+            tag_label = "BEAT" if (h_sue and h_sue > 0.5) else ("MISS" if (h_sue and h_sue < -0.5) else "IN-LINE")
+
+            earn_rows_html += f"""
+            <tr class="border-b border-gray-800/50 hover:bg-gray-800/30 text-xs font-mono">
+              <td class="py-1.5 px-3 font-bold text-white flex items-center gap-2">
+                <span>{dt}</span>
+                <span class="text-[9px] font-bold px-1.5 py-0.5 rounded border {tag_class}">{tag_label}</span>
+              </td>
+              <td class="py-1.5 px-3 text-right text-gray-300">{est_str}</td>
+              <td class="py-1.5 px-3 text-right text-white font-bold">{act_str}</td>
+              <td class="py-1.5 px-3 text-right font-bold {surp_color}">{surp_str}</td>
+              <td class="py-1.5 px-3 text-right font-mono text-gray-300">{sue_str}</td>
+              <td class="py-1.5 px-3 text-right font-bold {gap_color}">{gap_str}</td>
+              <td class="py-1.5 px-3 text-right font-bold {drift_color}">{drift_str}</td>
+            </tr>
+            """
+
+        days_earn_display = f"{days_earn} Days" if days_earn is not None else "TBD"
+        days_macro_display = f"{days_macro} Days" if days_macro is not None else "TBD"
+
+        events_html = f"""
+    <!-- CORPORATE CATALYST AWARENESS & PEAD MODELS ROW -->
+    <div class="bg-gray-950/70 border border-teal-900/40 rounded-2xl p-5 shadow-sm">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full {pulse_color} animate-pulse"></span>
+          <h2 class="text-xs font-bold text-teal-300 uppercase tracking-wider">Corporate Catalyst Awareness &amp; Event Risk (PEAD Models)</h2>
+        </div>
+        <div class="text-[11px] text-gray-400 font-mono">
+          Pre-Earnings De-Grossing &bull; Standardized Unexpected Earnings (SUE) &bull; Macro Calendar (FOMC/CPI)
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+        <!-- 1. CATALYST PROXIMITY & STATUS -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Catalyst Proximity</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {badge_cat}">
+                {status_code}
+              </span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              <span class="{status_color}">{days_earn_display}</span> <span class="text-xs font-normal text-gray-400">to Next Report</span>
+            </div>
+            <div class="text-[11px] text-gray-300 mt-1 font-medium">
+              Next Date: <span class="text-white font-bold">{next_earn_date}</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
+            {status_desc}
+          </div>
+        </div>
+
+        <!-- 2. MACRO CALENDAR RISK -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Macro Catalyst</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-cyan-500/10 text-cyan-400 border-cyan-500/30">
+                {next_macro_event}
+              </span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              <span class="text-cyan-400">{days_macro_display}</span> <span class="text-xs font-normal text-gray-400">to Macro Event</span>
+            </div>
+            <div class="text-[11px] text-gray-300 mt-1 font-medium">
+              Event Date: <span class="text-white font-bold">{next_macro_date}</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
+            Monitors FOMC interest rate decisions and CPI releases to prevent systemic factor shocks.
+          </div>
+        </div>
+
+        <!-- 3. PEAD DYNAMICS & SUE SCORE -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">PEAD Drift Status</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {pead_badge}">
+                {pead_regime}
+              </span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              <span class="{pead_color}">SUE {sue:+.2f}</span>
+            </div>
+            <div class="text-[11px] text-gray-300 mt-1 font-medium flex justify-between">
+              <span>Gap: <strong class="{pead_color}">{gap_pct:+.2f}%</strong></span>
+              <span>30d Drift: <strong class="{pead_color}">{drift_pct:+.2f}%</strong></span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
+            Reported on {recent_earn_date}. Quantifies institutional post-announcement underreaction momentum.
+          </div>
+        </div>
+
+        <!-- 4. RISK DE-GROSSING MULTIPLIER -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Position Haircut</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' if haircut >= 1.0 else ('bg-amber-500/10 text-amber-400 border-amber-500/30' if haircut > 0 else 'bg-rose-500/10 text-rose-400 border-rose-500/30')}">
+                {haircut_pct}% Allocation
+              </span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              <span class="{'text-emerald-400' if haircut >= 1.0 else ('text-amber-400' if haircut > 0 else 'text-rose-400')}">{haircut:.1f}x</span> <span class="text-xs font-normal text-gray-400">Sizing Factor</span>
+            </div>
+            <div class="text-[11px] text-gray-300 mt-1 font-medium">
+              Binary Gap Risk: <span class="text-white font-bold">&plusmn;{gap_sd*100:.1f}%</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
+            {risk_advice}
+          </div>
+        </div>
+      </div>
+
+      <!-- HISTORICAL EARNINGS REACTIONS TABLE -->
+      <div class="bg-gray-900/60 border border-gray-800/80 rounded-xl p-4">
+        <div class="flex justify-between items-center mb-2">
+          <span class="text-xs font-bold text-gray-300 uppercase tracking-wider">Quarterly Earnings Surprise &amp; Post-Announcement Drift History</span>
+          <span class="text-[10px] text-gray-400">SUE = Standardized Unexpected Earnings &bull; Tau = 21-Day Half-Life Momentum</span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left">
+            <thead>
+              <tr class="border-b border-gray-800 text-[10px] text-gray-400 font-mono">
+                <th class="py-1 px-3">REPORT DATE</th>
+                <th class="py-1 px-3 text-right">CONSENSUS EPS</th>
+                <th class="py-1 px-3 text-right">ACTUAL EPS</th>
+                <th class="py-1 px-3 text-right">SURPRISE %</th>
+                <th class="py-1 px-3 text-right">SUE SCORE</th>
+                <th class="py-1 px-3 text-right">ANNOUNCEMENT GAP</th>
+                <th class="py-1 px-3 text-right">30D POST DRIFT</th>
+              </tr>
+            </thead>
+            <tbody>
+              {earn_rows_html if earn_rows_html else '<tr><td colspan="7" class="py-2 text-center text-gray-500 text-xs font-mono">No historical quarterly reports available</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    """
+
     # Convert payloads to JSON
     json_history = json.dumps(history_payload)
     json_best_buys = json.dumps(best_buys)
@@ -662,6 +895,7 @@ def generate_html_dashboard(
     json_regime = json.dumps(regime) if regime else "{}"
     json_micro = json.dumps(micro) if micro else "{}"
     json_derivatives = json.dumps(derivatives) if derivatives else "{}"
+    json_events = json.dumps(events) if events else "{}"
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -826,6 +1060,8 @@ def generate_html_dashboard(
           <div class="flex justify-between"><span class="text-gray-500">Key Support:</span> <span class="text-gray-300 font-medium">${pred['key_support']:.2f}</span></div>
           {f'''<div class="flex justify-between"><span class="text-gray-500">BOCD Regime:</span> <span class="text-amber-300 font-medium">{pred.get("bocd_regime_name")}</span></div>''' if pred.get("bocd_regime_name") else ''}
           {f'''<div class="flex justify-between"><span class="text-gray-500">63d Changepoint Risk:</span> <span class="text-red-400 font-mono font-medium">{pred.get("bocd_forward_changepoint_prob_pct"):.1f}%</span></div>''' if pred.get("bocd_forward_changepoint_prob_pct") is not None else ''}
+          {f'''<div class="flex justify-between"><span class="text-gray-500">Catalyst Proximity:</span> <span class="{'text-rose-400' if pred.get('catalyst_status') in ('CRITICAL_EVENT', 'IMMINENT_DEGROSS') else ('text-amber-400' if pred.get('catalyst_status') == 'APPROACHING' else 'text-emerald-400')} font-medium">{pred.get("catalyst_status")} ({pred.get("earnings_days_away")}d)</span></div>''' if pred.get("earnings_days_away") is not None else ''}
+          {f'''<div class="flex justify-between"><span class="text-gray-500">PEAD Regime:</span> <span class="{'text-emerald-300' if 'bullish' in str(pred.get('pead_regime','')).lower() else ('text-rose-300' if 'bearish' in str(pred.get('pead_regime','')).lower() else 'text-gray-400')} font-medium">{pred.get("pead_regime")}</span></div>''' if pred.get("pead_regime") else ''}
         </div>
       </div>
     </div>
@@ -836,6 +1072,8 @@ def generate_html_dashboard(
 
     {derivatives_html}
 
+    {events_html}
+
     <!-- FORWARD RETURN PROJECTIONS & PROBABILITY SCORES ROW -->
     <div class="bg-gray-950/60 border border-purple-900/30 rounded-2xl p-5 shadow-sm">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
@@ -843,7 +1081,7 @@ def generate_html_dashboard(
           <span class="w-2.5 h-2.5 rounded-full bg-purple-400 animate-pulse"></span>
           <h2 class="text-xs font-bold text-purple-300 uppercase tracking-wider">Forward Return Projections &amp; Probability Analysis</h2>
         </div>
-        <span class="text-[11px] text-gray-400 font-medium">Dynamically conditioned on BOCD regime risk, microstructure &amp; Dealer GEX volatility</span>
+        <span class="text-[11px] text-gray-400 font-medium">Dynamically conditioned on BOCD regime risk, microstructure, Dealer GEX volatility &amp; PEAD drift</span>
       </div>
       <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
         {proj_cards_html}
@@ -876,6 +1114,11 @@ def generate_html_dashboard(
             </button>
           </div>
 
+          <!-- Momentum Events Toggle Button -->
+          <button id="btn-toggle-events" onclick="toggleEventsDisplay()" title="Toggle Key Momentum Events (Earnings Beats/Misses, BOCD Shifts, FOMC Pivots)" class="px-2.5 py-1 rounded font-medium text-emerald-400 bg-emerald-950/50 border border-emerald-700/60 hover:text-white hover:bg-emerald-900 transition flex items-center gap-1.5 text-xs">
+            <span>⚡</span> <span id="lbl-toggle-events">Key Events: ON</span>
+          </button>
+
           <!-- Period Buttons -->
           <div class="flex items-center gap-1 bg-gray-800/80 p-1 rounded-lg border border-gray-700 text-xs">
             <button id="btn-1y" onclick="setPeriod('1Y')" class="px-3 py-1 rounded font-medium transition text-gray-400 hover:text-white">1 Year</button>
@@ -905,15 +1148,18 @@ def generate_html_dashboard(
 
       <!-- Legend & Controls -->
       <div class="flex flex-wrap items-center justify-between text-xs text-gray-400 mt-3 pt-3 border-t border-gray-800">
-        <div class="flex items-center gap-4">
+        <div class="flex flex-wrap items-center gap-3">
           <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-blue-500 inline-block"></span> Close Price</span>
           <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-amber-400 inline-block"></span> 50-Day MA</span>
           <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-purple-400 inline-block"></span> 200-Day MA</span>
           <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-cyan-400 inline-block"></span> YTD AVWAP (&plusmn;1&sigma;)</span>
-          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-amber-400 inline-block"></span> Best Buy Point</span>
-          <span class="flex items-center gap-1.5"><span class="w-3.5 h-2 bg-emerald-500/25 border border-emerald-500/50 inline-block"></span> Subsequent Rally Window</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-amber-400 inline-block"></span> Best Buy</span>
+          <span class="flex items-center gap-1.5"><span class="px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-300 border border-emerald-600 text-[9px] font-bold">E ▲</span> Beat</span>
+          <span class="flex items-center gap-1.5"><span class="px-1.5 py-0.2 rounded bg-rose-950 text-rose-300 border border-rose-600 text-[9px] font-bold">E ▼</span> Miss</span>
+          <span class="flex items-center gap-1.5"><span class="text-amber-400 text-xs font-bold">⚡</span> BOCD Shift</span>
+          <span class="flex items-center gap-1.5"><span class="text-cyan-400 text-xs font-bold">◆</span> FOMC</span>
         </div>
-        <div>Drag across chart or scroll wheel to zoom into any period &bull; Click milestone below to zoom to trade.</div>
+        <div>Drag across chart or scroll wheel to zoom &bull; Toggle key events above.</div>
       </div>
 
       <!-- DEDICATED TIMELINE CHART OVERLAY -->
@@ -1054,10 +1300,30 @@ def generate_html_dashboard(
     const PREDICTIVE = {json_predictive};
     const PERFORMANCE = {json_performance};
     const DERIVATIVES = {json_derivatives};
+    const EVENTS = {json_events};
+    const MOMENTUM_EVENTS = (EVENTS && EVENTS.momentum_events) ? EVENTS.momentum_events : [];
 
     let currentPeriod = '5Y';
     let filteredHistory = [];
     let currentBestBuys = [];
+    let showMomentumEvents = true;
+    let activeChartEventPins = [];
+
+    function toggleEventsDisplay() {{
+      showMomentumEvents = !showMomentumEvents;
+      const btn = document.getElementById('btn-toggle-events');
+      const lbl = document.getElementById('lbl-toggle-events');
+      if (btn && lbl) {{
+        if (showMomentumEvents) {{
+          btn.className = 'px-2.5 py-1 rounded font-medium text-emerald-400 bg-emerald-950/50 border border-emerald-700/60 hover:text-white hover:bg-emerald-900 transition flex items-center gap-1.5 text-xs';
+          lbl.textContent = 'Key Events: ON';
+        }} else {{
+          btn.className = 'px-2.5 py-1 rounded font-medium text-gray-400 bg-gray-800/60 border border-gray-700 hover:text-white hover:bg-gray-700 transition flex items-center gap-1.5 text-xs';
+          lbl.textContent = 'Key Events: OFF';
+        }}
+      }}
+      renderHistoricalChart();
+    }}
 
     // Helper: calculate Simple Moving Average
     function calculateSMA(data, period) {{
@@ -1363,6 +1629,7 @@ def generate_html_dashboard(
       const plotHeight = height - padding.top - padding.bottom;
 
       ctx.clearRect(0, 0, width, height);
+      activeChartEventPins = [];
 
       if (filteredHistory.length === 0) return;
 
@@ -1592,6 +1859,140 @@ def generate_html_dashboard(
         }}
       }});
 
+      // Render Key Momentum-Shifting Events (Interactive Pins on Main Chart)
+      if (showMomentumEvents && MOMENTUM_EVENTS && MOMENTUM_EVENTS.length > 0) {{
+        MOMENTUM_EVENTS.forEach((ev, i) => {{
+          let idx = filteredHistory.findIndex(d => d.date === ev.date);
+          if (idx < 0) {{
+            // Find closest trading day within 3 calendar days if exact event date was a weekend/holiday
+            const targetTime = new Date(ev.date).getTime();
+            let bestDiff = Infinity;
+            let bestIdx = -1;
+            for (let j = 0; j < filteredHistory.length; j++) {{
+              const diff = Math.abs(new Date(filteredHistory[j].date).getTime() - targetTime);
+              if (diff < bestDiff && diff <= 4 * 86400000) {{
+                bestDiff = diff;
+                bestIdx = j;
+              }}
+            }}
+            idx = bestIdx;
+          }}
+
+          if (idx >= 0) {{
+            const x = getX(idx);
+            const closePrice = filteredHistory[idx].close;
+            const y = getY(closePrice);
+
+            const evType = ev.type || ev.event_type || '';
+
+            let iconText = '⚡';
+            let bgFill = '#451a03';
+            let strokeColor = '#f59e0b';
+            let textColor = '#fef3c7';
+
+            if (evType === 'EARNINGS_BEAT') {{
+              iconText = 'E ▲';
+              bgFill = '#064e3b';
+              strokeColor = '#10b981';
+              textColor = '#a7f3d0';
+            }} else if (evType === 'EARNINGS_MISS') {{
+              iconText = 'E ▼';
+              bgFill = '#4c0519';
+              strokeColor = '#f43f5e';
+              textColor = '#fecdd3';
+            }} else if (evType === 'FOMC_PIVOT') {{
+              iconText = '◆ FOMC';
+              bgFill = '#164e63';
+              strokeColor = '#06b6d4';
+              textColor = '#cffafe';
+            }} else if (evType.startsWith('BOCD')) {{
+              iconText = '⚡ Shift';
+              bgFill = '#451a03';
+              strokeColor = '#f59e0b';
+              textColor = '#fef3c7';
+            }} else if (evType === 'CPI_RELEASE') {{
+              iconText = 'CPI';
+              bgFill = '#312e81';
+              strokeColor = '#818cf8';
+              textColor = '#e0e7ff';
+            }}
+
+            const badgeH = 17;
+            ctx.font = 'bold 9px monospace';
+            const textWidth = ctx.measureText(iconText).width + 10;
+            const badgeX = Math.min(width - padding.right - textWidth - 2, Math.max(padding.left + 2, x - textWidth / 2));
+
+            // Stagger stem heights across 3 levels to minimize overlaps
+            const stemHeight = (i % 3 === 0) ? 42 : ((i % 3 === 1) ? 65 : 88);
+
+            // Top boundary avoidance: if price is near chart top, place badge below the price line
+            let markerY = y - stemHeight;
+            let isStemDown = false;
+            if (markerY < padding.top + 6) {{
+              markerY = Math.min(height - padding.bottom - badgeH - 4, y + stemHeight);
+              isStemDown = true;
+            }} else {{
+              markerY = Math.max(padding.top + 4, markerY);
+            }}
+
+            // Draw vertical dashed catalyst indicator stem
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = 1.2;
+            ctx.setLineDash([2, 2]);
+            ctx.beginPath();
+            if (isStemDown) {{
+              ctx.moveTo(x, y + 4);
+              ctx.lineTo(x, markerY);
+            }} else {{
+              ctx.moveTo(x, y - 4);
+              ctx.lineTo(x, markerY + badgeH);
+            }}
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Pin marker badge background
+            ctx.fillStyle = bgFill;
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = 1.3;
+            ctx.beginPath();
+            if (ctx.roundRect) {{
+              ctx.roundRect(badgeX, markerY, textWidth, badgeH, 4);
+            }} else {{
+              ctx.rect(badgeX, markerY, textWidth, badgeH);
+            }}
+            ctx.fill();
+            ctx.stroke();
+
+            // Text inside badge
+            ctx.fillStyle = textColor;
+            ctx.textAlign = 'center';
+            ctx.fillText(iconText, badgeX + textWidth / 2, markerY + 12);
+
+            // High-contrast anchor node on price curve
+            ctx.fillStyle = strokeColor;
+            ctx.beginPath();
+            ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            // Record active pin for hover hit-testing
+            activeChartEventPins.push({{
+              event: ev,
+              x: x,
+              y: y,
+              badgeX: badgeX,
+              badgeY: markerY,
+              badgeW: textWidth,
+              badgeH: badgeH,
+              date: filteredHistory[idx].date,
+              idx: idx
+            }});
+          }}
+        }});
+      }}
+
       // Draw Bottom X-Axis with Dynamic Zoom-Relative Date Labels
       const numDateTicks = Math.min(8, Math.max(4, Math.floor(plotWidth / 85)));
       ctx.fillStyle = '#9ca3af';
@@ -1659,6 +2060,29 @@ def generate_html_dashboard(
       // Check if near any Best Buy point
       const nearBuy = currentBestBuys.find(b => b.date === d.date);
 
+      // Check if mouse is hovering over or near any Key Momentum Event Pin
+      let nearEventPin = null;
+      if (showMomentumEvents && activeChartEventPins.length > 0) {{
+        // Priority 1: Direct hit on pin badge bounding box (+/- 4px hit area)
+        nearEventPin = activeChartEventPins.find(p =>
+          mouseX >= p.badgeX - 4 && mouseX <= p.badgeX + p.badgeW + 4 &&
+          mouseY >= p.badgeY - 4 && mouseY <= p.badgeY + p.badgeH + 4
+        );
+        // Priority 2: Near pin vertical stem (within 8px horizontal, along stem line)
+        if (!nearEventPin) {{
+          nearEventPin = activeChartEventPins.find(p => {{
+            const minY = Math.min(p.y, p.badgeY);
+            const maxY = Math.max(p.y, p.badgeY + p.badgeH);
+            return Math.abs(mouseX - p.x) <= 8 && mouseY >= minY - 4 && mouseY <= maxY + 4;
+          }});
+        }}
+        // Priority 3: Crosshair matching event trading date index (within 1 bar)
+        if (!nearEventPin) {{
+          nearEventPin = activeChartEventPins.find(p => Math.abs(p.idx - idx) <= 1 && Math.abs(mouseX - p.x) <= 12);
+        }}
+      }}
+      const nearEvent = nearEventPin ? nearEventPin.event : null;
+
       let tooltipHtml = `
         <div class="font-bold text-white mb-1">${{d.date}}</div>
         <div class="text-blue-400 font-semibold">Close: $${{d.close.toFixed(2)}}</div>
@@ -1673,6 +2097,66 @@ def generate_html_dashboard(
             <div class="text-emerald-400 font-bold mt-0.5">Peak: $${{nearBuy.peak_price.toFixed(2)}} (+${{nearBuy.max_gain_pct.toFixed(1)}}%)</div>
             <div class="text-gray-400 text-[10px]">Held: ${{nearBuy.holding_days}} days to ${{nearBuy.peak_date}}</div>
             <div class="text-gray-300 text-[10px] mt-1">${{nearBuy.rationale}}</div>
+          </div>
+        `;
+      }}
+      if (nearEvent) {{
+        const evType = nearEvent.type || nearEvent.event_type || '';
+        let evBadgeColor = 'text-amber-400';
+        let evBorderColor = 'border-amber-500/50';
+        let evBgColor = 'bg-amber-950/40';
+        let evIcon = '⚡';
+
+        if (evType === 'EARNINGS_BEAT') {{
+          evBadgeColor = 'text-emerald-400';
+          evBorderColor = 'border-emerald-500/50';
+          evBgColor = 'bg-emerald-950/40';
+          evIcon = 'E ▲';
+        }} else if (evType === 'EARNINGS_MISS') {{
+          evBadgeColor = 'text-rose-400';
+          evBorderColor = 'border-rose-500/50';
+          evBgColor = 'bg-rose-950/40';
+          evIcon = 'E ▼';
+        }} else if (evType === 'FOMC_PIVOT') {{
+          evBadgeColor = 'text-cyan-400';
+          evBorderColor = 'border-cyan-500/50';
+          evBgColor = 'bg-cyan-950/40';
+          evIcon = '◆';
+        }} else if (evType.startsWith('BOCD')) {{
+          evBadgeColor = 'text-amber-400';
+          evBorderColor = 'border-amber-500/50';
+          evBgColor = 'bg-amber-950/40';
+          evIcon = '⚡';
+        }}
+
+        const title = nearEvent.title || nearEvent.badge || evType;
+        const gapVal = (nearEvent.gap_pct !== undefined && nearEvent.gap_pct !== null) ? nearEvent.gap_pct : nearEvent.announcement_gap_pct;
+        const driftVal = (nearEvent.drift_30d_pct !== undefined && nearEvent.drift_30d_pct !== null) ? nearEvent.drift_30d_pct : nearEvent.post_drift_30d_pct;
+        const detailsText = nearEvent.details || nearEvent.detail || nearEvent.description || '';
+        const impactText = nearEvent.momentum_impact || '';
+        const evPrice = nearEvent.price ? ('$' + Number(nearEvent.price).toFixed(2)) : ('$' + d.close.toFixed(2));
+
+        tooltipHtml += `
+          <div class="mt-2.5 pt-2.5 border-t border-gray-700">
+            <div class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-bold ${{evBadgeColor}} ${{evBgColor}} border ${{evBorderColor}} mb-1.5">
+              <span>${{evIcon}}</span>
+              <span>${{title}}</span>
+            </div>
+            <div class="text-xs text-gray-200 font-semibold mb-1">Event Date: ${{nearEvent.date}} (${{evPrice}})</div>
+            ${{detailsText ? `<div class="text-gray-300 text-[11px] mb-1 font-mono">${{detailsText}}</div>` : ''}}
+            ${{gapVal !== undefined && gapVal !== null ? `
+              <div class="text-gray-300 text-[11px] flex justify-between gap-2">
+                <span>Announcement Day Reaction:</span>
+                <span class="font-bold ${{gapVal >= 0 ? 'text-emerald-400' : 'text-rose-400'}}">${{gapVal > 0 ? '+' : ''}}${{Number(gapVal).toFixed(1)}}%</span>
+              </div>
+            ` : ''}}
+            ${{driftVal !== undefined && driftVal !== null ? `
+              <div class="text-gray-300 text-[11px] flex justify-between gap-2">
+                <span>30-Day Forward Drift:</span>
+                <span class="font-bold ${{driftVal >= 0 ? 'text-emerald-400' : 'text-rose-400'}}">${{driftVal > 0 ? '+' : ''}}${{Number(driftVal).toFixed(1)}}%</span>
+              </div>
+            ` : ''}}
+            ${{impactText ? `<div class="text-cyan-300 text-[10px] mt-1.5 bg-gray-800/80 px-1.5 py-0.5 rounded border border-gray-700/60 font-mono">${{impactText}}</div>` : ''}}
           </div>
         `;
       }}
@@ -1970,6 +2454,50 @@ def generate_html_dashboard(
       ctx.stroke();
       ctx.setLineDash([]);
 
+      // 4. Upcoming Corporate Earnings Catalyst Vertical Line & Event Risk Zone
+      if (PREDICTIVE.next_earnings_date) {{
+        const earnIdx = forecastSeries.findIndex(f => f.date === PREDICTIVE.next_earnings_date);
+        if (earnIdx >= 0) {{
+          const xEarn = getX(histLen + earnIdx);
+
+          // Shaded event risk binary gap corridor
+          ctx.fillStyle = 'rgba(239, 68, 68, 0.12)';
+          ctx.fillRect(xEarn - 12, padding.top, 24, plotHeight);
+
+          // Vertical dashed event line
+          ctx.strokeStyle = '#ef4444';
+          ctx.lineWidth = 1.8;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.moveTo(xEarn, padding.top);
+          ctx.lineTo(xEarn, height - padding.bottom);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Flag tag at top
+          const earnTag = `📅 Earnings: ${{PREDICTIVE.next_earnings_date}}`;
+          ctx.font = 'bold 9px monospace';
+          const earnTagW = ctx.measureText(earnTag).width + 10;
+          const earnTagX = Math.min(width - padding.right - earnTagW - 4, Math.max(padding.left + 4, xEarn - earnTagW / 2));
+
+          ctx.fillStyle = '#7f1d1d';
+          ctx.strokeStyle = '#ef4444';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          if (ctx.roundRect) {{
+            ctx.roundRect(earnTagX, padding.top + 4, earnTagW, 16, 3);
+          }} else {{
+            ctx.rect(earnTagX, padding.top + 4, earnTagW, 16);
+          }}
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = '#fca5a5';
+          ctx.textAlign = 'center';
+          ctx.fillText(earnTag, earnTagX + earnTagW / 2, padding.top + 15);
+        }}
+      }}
+
       // Vertical line separating history and forecast
       const splitX = getX(histLen - 1);
       ctx.strokeStyle = '#4b5563';
@@ -2213,6 +2741,23 @@ def main():
         if vol_info:
             print(f"30-Day ATM IV:      {vol_info.get('atm_iv_30d_pct', 0):.1f}% | VRP: {vol_info.get('vrp_pct', 0):+.1f}% | 25d Skew: {vol_info.get('skew_25d_rr_pct', 0):+.2f}%")
 
+    evt = analysis_data.get("events")
+    if evt and evt.get("catalyst_status"):
+        cat = evt["catalyst_status"]
+        pead = evt.get("pead", {})
+        degross = evt.get("degrossing", {})
+        print("\n-------------------------------------------------------")
+        print(" CORPORATE CATALYST AWARENESS & PEAD MODELS")
+        print("-------------------------------------------------------")
+        days_earn_str = f"{cat.get('days_to_earnings')} business days away" if cat.get('days_to_earnings') is not None else "N/A"
+        print(f"Catalyst Status:    {cat.get('status_code', 'SAFE')} ({cat.get('urgency_level', 'NORMAL')})")
+        print(f"Next Earnings:      {cat.get('next_earnings_date', 'TBD')} ({days_earn_str})")
+        days_macro_str = f"{cat.get('days_to_macro')} business days away" if cat.get('days_to_macro') is not None else "N/A"
+        print(f"Next Macro Event:   {cat.get('next_macro_event', 'FOMC/CPI')} on {cat.get('next_macro_date', 'TBD')} ({days_macro_str})")
+        haircut_pct = int(degross.get('position_haircut', 1.0) * 100)
+        print(f"Risk De-Grossing:   {haircut_pct}% Capital Allocation ({degross.get('risk_advice', 'Normal')})")
+        print(f"PEAD Regime:        {pead.get('drift_regime', 'NEUTRAL')} (SUE: {pead.get('sue_score', 0):+.2f} | 30d Drift: {pead.get('post_earnings_drift_pct', 0):+.2f}%)")
+
     proj = analysis_data.get("projections", {})
     if proj:
         print("\n-------------------------------------------------------")
@@ -2236,6 +2781,11 @@ def main():
         cw_str = f"${pred.get('call_wall_price', 0):.2f}" if pred.get('call_wall_price') else "N/A"
         pw_str = f"${pred.get('put_wall_price', 0):.2f}" if pred.get('put_wall_price') else "N/A"
         print(f"Dealer GEX Regime:  {pred['gex_regime']} (Call Wall: {cw_str} | Put Wall: {pw_str})")
+    if pred.get("catalyst_status"):
+        haircut_val = pred.get("event_haircut", 1.0)
+        print(f"Catalyst Risk:      {pred['catalyst_status']} ({int(haircut_val*100)}% Position Sizing)")
+    if pred.get("pead_regime"):
+        print(f"PEAD Momentum:      {pred['pead_regime']}")
     print(f"Action:             {pred['action_summary']}")
     print(f"Optimal Entry Zone: ${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}")
     print(f"Optimal Window:     {pred['optimal_buy_window']['description']}")
