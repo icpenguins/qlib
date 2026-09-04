@@ -375,6 +375,92 @@ class TestStockAnalysisEngine(unittest.TestCase):
             cond_risk_off["3Y"]["bocd_changepoint_prob_pct"],
         )
 
+    def test_predict_future_buy_timing_gex_conditioning(self):
+        """Test that Dealer GEX (+GEX vs -GEX) conditions future buy timing, support/resistance, and volatility."""
+        last_price = float(self.df_synthetic["close"].iloc[-1])
+
+        # Positive GEX (Mean-reverting, pinned to call wall, volatility dampened)
+        pos_gex_deriv = {
+            "gex": {
+                "regime": "+GEX (Low Volatility / Mean Reversion)",
+                "net_gex_dollar_per_1pct": 25_000_000.0,
+                "call_wall_strike": round(last_price * 1.10, 2),
+                "put_wall_strike": round(last_price * 0.92, 2),
+                "gamma_flip_price": round(last_price * 0.95, 2),
+                "max_pain_strike": round(last_price * 1.02, 2),
+            },
+            "vol_surface": {
+                "atm_iv_30d_pct": 22.5,
+                "vrp_pct": 3.2,
+                "skew_25d_rr_pct": -1.8,
+            },
+        }
+
+        pred_pos = predict_future_buy_timing(
+            self.df_synthetic,
+            forecast_days=63,
+            derivatives=pos_gex_deriv,
+        )
+
+        self.assertEqual(pred_pos["gex_regime"], "+GEX (Low Volatility / Mean Reversion)")
+        self.assertEqual(pred_pos["gex_vol_multiplier"], 0.85)
+        self.assertEqual(pred_pos["call_wall_price"], pos_gex_deriv["gex"]["call_wall_strike"])
+        self.assertEqual(pred_pos["put_wall_price"], pos_gex_deriv["gex"]["put_wall_strike"])
+        self.assertEqual(pred_pos["gamma_flip_price"], pos_gex_deriv["gex"]["gamma_flip_price"])
+        self.assertIn("+GEX", pred_pos["action_summary"])
+        self.assertIn("Dealer counter-trading pins price", pred_pos["action_summary"])
+
+        # Negative GEX (High volatility, trending, volatility amplified)
+        neg_gex_deriv = {
+            "gex": {
+                "regime": "-GEX (High Volatility / Directional Trend)",
+                "net_gex_dollar_per_1pct": -18_000_000.0,
+                "call_wall_strike": round(last_price * 1.08, 2),
+                "put_wall_strike": round(last_price * 0.88, 2),
+                "gamma_flip_price": round(last_price * 1.04, 2),
+                "max_pain_strike": round(last_price * 0.98, 2),
+            },
+            "vol_surface": {
+                "atm_iv_30d_pct": 45.0,
+                "vrp_pct": -4.5,
+                "skew_25d_rr_pct": -6.2,
+            },
+        }
+
+        pred_neg = predict_future_buy_timing(
+            self.df_synthetic,
+            forecast_days=63,
+            derivatives=neg_gex_deriv,
+        )
+
+        self.assertEqual(pred_neg["gex_regime"], "-GEX (High Volatility / Directional Trend)")
+        self.assertEqual(pred_neg["gex_vol_multiplier"], 1.25)
+        self.assertIn("-GEX", pred_neg["action_summary"])
+        self.assertIn("Dealer dynamic hedging accelerates drops", pred_neg["action_summary"])
+
+    def test_run_stock_analysis_with_derivatives(self):
+        """Test full run_stock_analysis pipeline including derivatives computation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            (data_dir / "TEST_GEX.csv").write_text(self.df_synthetic.to_csv(index=False), encoding="utf-8")
+            max_date = self.df_synthetic["date"].max()
+            analysis = run_stock_analysis("TEST_GEX", data_dir, auto_download=False, request_date=max_date)
+
+            self.assertIn("derivatives", analysis)
+            deriv = analysis["derivatives"]
+            self.assertIsNotNone(deriv)
+            self.assertIn("gex", deriv)
+            self.assertIn("vol_surface", deriv)
+            self.assertIn("net_gex_dollar_per_1pct", deriv["gex"])
+            self.assertIn("call_wall_strike", deriv["gex"])
+            self.assertIn("put_wall_strike", deriv["gex"])
+            self.assertIn("regime", deriv["gex"])
+
+            # Predictive buy analysis should reflect GEX
+            pred = analysis["predictive"]
+            self.assertIn("gex_regime", pred)
+            self.assertIn("call_wall_price", pred)
+            self.assertIn("put_wall_price", pred)
 
 if __name__ == "__main__":
     unittest.main()

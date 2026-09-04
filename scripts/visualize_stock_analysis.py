@@ -137,6 +137,7 @@ def generate_html_dashboard(
             df,
             regime=analysis_data.get("regime"),
             microstructure=analysis_data.get("microstructure"),
+            derivatives=analysis_data.get("derivatives"),
         )
 
     # Build projection cards HTML for 6M, 1Y, 2Y, 3Y
@@ -214,6 +215,10 @@ def generate_html_dashboard(
               <span>BOCD Shift Risk:</span>
               <span class="font-mono text-purple-300 font-semibold">{p_data.get("bocd_changepoint_prob_pct"):.0f}%</span>
             </div>''' if p_data.get("bocd_changepoint_prob_pct") is not None else ''}
+            {f'''<div class="flex justify-between text-gray-500 text-[10px]">
+              <span>GEX State:</span>
+              <span class="font-mono text-fuchsia-300 font-semibold">{'+GEX (Stabilizer)' if p_data.get('dealer_gex_regime', '').startswith('+') else '-GEX (Accelerant)'}</span>
+            </div>''' if p_data.get("dealer_gex_regime") else ''}
           </div>
         </div>
         """
@@ -445,6 +450,209 @@ def generate_html_dashboard(
     </div>
     """
 
+    # Build Institutional Derivatives & Dealer Gamma Exposure Card
+    derivatives = analysis_data.get("derivatives")
+    derivatives_html = ""
+    if derivatives:
+        net_gex = derivatives.get("net_gex_millions", 0.0)
+        net_gex_color = "text-emerald-400" if net_gex >= 0 else "text-rose-400"
+        net_gex_sign = "+" if net_gex >= 0 else ""
+        gex_regime_title = derivatives.get("regime", "N/A")
+        badge_class = derivatives.get("badge_class", "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" if net_gex >= 0 else "bg-rose-500/10 text-rose-400 border-rose-500/30")
+        gamma_flip = derivatives.get("gamma_flip_price", 0.0)
+        dist_flip = derivatives.get("dist_to_flip_pct", 0.0)
+        call_wall = derivatives.get("call_wall", 0.0)
+        put_wall = derivatives.get("put_wall", 0.0)
+        max_pain = derivatives.get("max_pain", 0.0)
+        vrp = derivatives.get("vrp_pct", 0.0)
+        rr25 = derivatives.get("rr25_skew", 0.0)
+        skew_regime = derivatives.get("skew_regime", "Normal Equity Skew")
+        spot_price = float(df["close"].iloc[-1]) if "close" in df.columns else 0.0
+
+        # Build Strike Profile rows for table/bars
+        strike_profile = derivatives.get("strike_profile", [])
+        near_strikes = [s for s in strike_profile if spot_price * 0.88 <= s["strike"] <= spot_price * 1.12]
+        if not near_strikes:
+            near_strikes = strike_profile[:12]
+
+        max_abs_gex = max([abs(s.get("net_gex_m", 0.0)) for s in near_strikes] + [1.0])
+
+        strike_bars_html = ""
+        for s in near_strikes:
+            k = s["strike"]
+            net_val = s.get("net_gex_m", 0.0)
+            call_g = s.get("call_gex_m", 0.0)
+            put_g = s.get("put_gex_m", 0.0)
+            oi = s.get("open_interest", 0)
+
+            tag = ""
+            row_bg = ""
+            if abs(k - spot_price) == min(abs(x["strike"] - spot_price) for x in near_strikes):
+                tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-blue-500/20 text-blue-300 rounded border border-blue-500/40">SPOT</span>'
+                row_bg = "bg-blue-950/20"
+            elif k == call_wall:
+                tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-emerald-500/20 text-emerald-300 rounded border border-emerald-500/40">CALL WALL</span>'
+                row_bg = "bg-emerald-950/20"
+            elif k == put_wall:
+                tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-rose-500/20 text-rose-300 rounded border border-rose-500/40">PUT WALL</span>'
+                row_bg = "bg-rose-950/20"
+            elif k == max_pain:
+                tag = '<span class="text-[9px] font-bold px-1.5 py-0.5 bg-purple-500/20 text-purple-300 rounded border border-purple-500/40">MAX PAIN</span>'
+
+            bar_pct = min(100, max(4, int(abs(net_val) / max_abs_gex * 100)))
+            bar_color = "bg-emerald-500" if net_val >= 0 else "bg-rose-500"
+
+            strike_bars_html += f"""
+            <tr class="border-b border-gray-800/50 hover:bg-gray-800/30 text-xs font-mono {row_bg}">
+              <td class="py-1 px-2 font-bold text-white">${k:.2f} {tag}</td>
+              <td class="py-1 px-2 text-right text-emerald-400">+{call_g:.2f}</td>
+              <td class="py-1 px-2 text-right text-rose-400">{put_g:.2f}</td>
+              <td class="py-1 px-2 text-right font-bold {'text-emerald-400' if net_val >= 0 else 'text-rose-400'}">{net_val:+.2f}</td>
+              <td class="py-1 px-2 w-32">
+                <div class="w-full bg-gray-800 rounded-full h-1.5 overflow-hidden">
+                  <div class="h-full {bar_color} rounded-full" style="width: {bar_pct}%;"></div>
+                </div>
+              </td>
+              <td class="py-1 px-2 text-right text-gray-400">{oi:,}</td>
+            </tr>
+            """
+
+        derivatives_html = f"""
+    <!-- INSTITUTIONAL DERIVATIVES & DEALER GAMMA EXPOSURE (GEX) ROW -->
+    <div class="bg-gray-950/70 border border-fuchsia-900/40 rounded-2xl p-5 shadow-sm">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-fuchsia-400 animate-pulse"></span>
+          <h2 class="text-xs font-bold text-fuchsia-300 uppercase tracking-wider">Institutional Derivatives &amp; Dealer Gamma Exposure (GEX)</h2>
+        </div>
+        <div class="text-[11px] text-gray-400 font-mono">
+          Black-Scholes Delta-Hedge Mechanics &bull; Volatility Triggers &bull; Variance Risk Premium
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+        <!-- DEALER NET GEX & REGIME -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Dealer Net GEX</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {badge_class}">
+                {'+GEX' if net_gex >= 0 else '-GEX'}
+              </span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              <span class="{net_gex_color}">{net_gex_sign}${net_gex:.2f}M</span> <span class="text-xs font-normal text-gray-400">/ 1% Move</span>
+            </div>
+            <div class="text-[11px] text-gray-300 mt-1 font-medium">
+              {gex_regime_title}
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
+            {derivatives.get('description', '')}
+          </div>
+        </div>
+
+        <!-- GAMMA FLIP & VOL TRIGGER -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Gamma Flip Point (S*)</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-purple-500/10 text-purple-400 border-purple-500/30">Vol Trigger</span>
+            </div>
+            <div class="text-xl font-black text-white mt-1">
+              ${gamma_flip:.2f} <span class="text-xs font-mono {'text-emerald-400' if dist_flip >= 0 else 'text-rose-400'}">({dist_flip:+.1f}%)</span>
+            </div>
+            <div class="text-[11px] text-gray-400 mt-1">
+              Zero-Gamma Inflection: <span class="font-mono text-gray-200">Spot {'Above' if spot_price >= gamma_flip else 'Below'} Threshold</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
+            Crossing below S* flips market makers from dampening mean-reverters into momentum sellers, triggering volatility expansion.
+          </div>
+        </div>
+
+        <!-- KEY GAMMA WALLS -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Structural Gamma Walls</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-teal-500/10 text-teal-400 border-teal-500/30">Order Flow Pins</span>
+            </div>
+            <div class="space-y-1.5 mt-1">
+              <div class="flex justify-between text-xs">
+                <span class="text-gray-400">Call Wall (Cap):</span>
+                <span class="font-bold text-emerald-400 font-mono">${call_wall:.2f}</span>
+              </div>
+              <div class="flex justify-between text-xs">
+                <span class="text-gray-400">Put Wall (Floor):</span>
+                <span class="font-bold text-rose-400 font-mono">${put_wall:.2f}</span>
+              </div>
+              <div class="flex justify-between text-xs">
+                <span class="text-gray-400">Max Pain Strike:</span>
+                <span class="font-bold text-purple-300 font-mono">${max_pain:.2f}</span>
+              </div>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-2">
+            Dealers pin price between Put Wall &amp; Call Wall; breaks past walls generate explosive gamma squeezes.
+          </div>
+        </div>
+
+        <!-- VOL SURFACE & VARIANCE RISK PREMIUM -->
+        <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Vol Surface &amp; Premium</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-blue-500/10 text-blue-400 border-blue-500/30">Risk Reversal</span>
+            </div>
+            <div class="space-y-1.5 mt-1">
+              <div class="flex justify-between text-xs">
+                <span class="text-gray-400">30d ATM Implied Vol:</span>
+                <span class="font-bold text-white font-mono">{derivatives.get('atm_iv_pct', 0.0):.1f}%</span>
+              </div>
+              <div class="flex justify-between text-xs">
+                <span class="text-gray-400">Variance Premium (VRP):</span>
+                <span class="font-bold font-mono {'text-emerald-400' if vrp >= 0 else 'text-rose-400'}">{vrp:+.2f}%</span>
+              </div>
+              <div class="flex justify-between text-xs">
+                <span class="text-gray-400">25&Delta; Put/Call Skew:</span>
+                <span class="font-bold text-amber-300 font-mono">{rr25:+.2f}%</span>
+              </div>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-2">
+            Skew Regime: <span class="text-gray-200 font-medium">{skew_regime}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- HORIZONTAL STRIKE GAMMA DISTRIBUTION TABLE -->
+      <div class="bg-gray-900/60 border border-gray-800/80 rounded-xl p-4">
+        <div class="flex justify-between items-center mb-2">
+          <span class="text-xs font-bold text-gray-300 uppercase tracking-wider">Strike-Level Gamma Exposure Profile ($M/1% Move around Spot ${spot_price:.2f})</span>
+          <span class="text-[10px] text-gray-400">Emerald = Long Gamma (+GEX) &bull; Rose = Short Gamma (-GEX)</span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left">
+            <thead>
+              <tr class="border-b border-gray-800 text-[10px] text-gray-400 font-mono">
+                <th class="py-1 px-2">STRIKE</th>
+                <th class="py-1 px-2 text-right">CALL GEX ($M)</th>
+                <th class="py-1 px-2 text-right">PUT GEX ($M)</th>
+                <th class="py-1 px-2 text-right">NET GEX ($M)</th>
+                <th class="py-1 px-2">NET PROFILE</th>
+                <th class="py-1 px-2 text-right">OPEN INTEREST</th>
+              </tr>
+            </thead>
+            <tbody>
+              {strike_bars_html}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    """
+
     # Convert payloads to JSON
     json_history = json.dumps(history_payload)
     json_best_buys = json.dumps(best_buys)
@@ -453,6 +661,7 @@ def generate_html_dashboard(
     json_projections = json.dumps(projections)
     json_regime = json.dumps(regime) if regime else "{}"
     json_micro = json.dumps(micro) if micro else "{}"
+    json_derivatives = json.dumps(derivatives) if derivatives else "{}"
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -625,6 +834,8 @@ def generate_html_dashboard(
 
     {micro_html}
 
+    {derivatives_html}
+
     <!-- FORWARD RETURN PROJECTIONS & PROBABILITY SCORES ROW -->
     <div class="bg-gray-950/60 border border-purple-900/30 rounded-2xl p-5 shadow-sm">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
@@ -632,7 +843,7 @@ def generate_html_dashboard(
           <span class="w-2.5 h-2.5 rounded-full bg-purple-400 animate-pulse"></span>
           <h2 class="text-xs font-bold text-purple-300 uppercase tracking-wider">Forward Return Projections &amp; Probability Analysis</h2>
         </div>
-        <span class="text-[11px] text-gray-400 font-medium">Dynamically conditioned on BOCD regime risk, hazard probabilities &amp; microstructure</span>
+        <span class="text-[11px] text-gray-400 font-medium">Dynamically conditioned on BOCD regime risk, microstructure &amp; Dealer GEX volatility</span>
       </div>
       <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
         {proj_cards_html}
@@ -728,12 +939,16 @@ def generate_html_dashboard(
             <h2 class="text-lg font-bold text-white">3-Month Predictive Buy Analysis</h2>
             <span class="text-xs px-2.5 py-0.5 rounded-full font-bold border {rec_badge_class}">{pred['recommendation']}</span>
             {f'''<span class="text-xs px-2.5 py-0.5 rounded-full font-semibold border bg-purple-500/10 text-purple-300 border-purple-500/30">BOCD: {pred.get("bocd_regime_name")}</span>''' if pred.get("bocd_regime_name") else ''}
+            {f'''<span class="text-xs px-2.5 py-0.5 rounded-full font-semibold border {'bg-emerald-500/10 text-emerald-300 border-emerald-500/30' if (pred.get('dealer_net_gex_m') or 0) >= 0 else 'bg-rose-500/10 text-rose-300 border-rose-500/30'}">GEX: {pred.get("dealer_gex_regime", "").split(" ")[0]}</span>''' if pred.get("dealer_gex_regime") else ''}
           </div>
           <p class="text-xs text-gray-400">
             BOCD jump-diffusion Monte Carlo path simulation with trend channels projecting 63 trading days forward from {perf['latest_date']}.
           </p>
         </div>
         <div class="flex flex-wrap items-center gap-3 text-xs">
+          {f'''<div class="bg-fuchsia-950/40 border border-fuchsia-800/40 px-3 py-1.5 rounded-lg text-fuchsia-300">
+            <span class="text-gray-400">Net GEX:</span> <strong>{'+' if (pred.get('dealer_net_gex_m') or 0) >= 0 else ''}{pred.get('dealer_net_gex_m', 0):.2f}M/1%</strong>
+          </div>''' if pred.get("dealer_net_gex_m") is not None else ''}
           {f'''<div class="bg-purple-950/40 border border-purple-800/40 px-3 py-1.5 rounded-lg text-purple-300">
             <span class="text-gray-400">63d Changepoint Risk:</span> <strong>{pred.get("bocd_forward_changepoint_prob_pct"):.1f}%</strong>
           </div>''' if pred.get("bocd_forward_changepoint_prob_pct") is not None else ''}
@@ -752,13 +967,26 @@ def generate_html_dashboard(
         <div id="forecastTooltip" class="absolute hidden pointer-events-none bg-gray-900/95 border border-gray-700 text-white text-xs rounded-lg p-3 shadow-2xl z-20 max-w-xs"></div>
       </div>
 
+      <!-- Forecast Chart Legend -->
+      <div class="flex flex-wrap items-center justify-between text-xs text-gray-400 mt-2 px-1">
+        <div class="flex flex-wrap items-center gap-4">
+          <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-blue-500 inline-block"></span> Recent Price</span>
+          <span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-emerald-500 inline-block border-dashed"></span> Median Path (p50)</span>
+          <span class="flex items-center gap-1.5"><span class="w-3 h-2 bg-emerald-500/15 border border-emerald-500/30 inline-block"></span> 10th-90th% Corridor</span>
+          <span class="flex items-center gap-1.5"><span class="w-3 h-2 bg-blue-500/30 border border-blue-400 inline-block"></span> Optimal Buy Zone</span>
+          {f'''<span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-emerald-400 inline-block"></span> Call Wall (${pred.get("call_gamma_wall"):.2f})</span>''' if pred.get("call_gamma_wall") else ''}
+          {f'''<span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-rose-500 inline-block"></span> Put Wall (${pred.get("put_gamma_wall"):.2f})</span>''' if pred.get("put_gamma_wall") else ''}
+          {f'''<span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-purple-400 inline-block"></span> Gamma Flip S* (${pred.get("gamma_flip_price"):.2f})</span>''' if pred.get("gamma_flip_price") else ''}
+        </div>
+      </div>
+
       <!-- Strategy Callout -->
       <div class="mt-4 p-4 rounded-xl bg-gray-950 border border-gray-800 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 text-xs">
         <div class="space-y-1">
           <span class="font-bold text-white text-sm">Tactical Execution Guidance:</span>
           <p class="text-gray-300">{pred['action_summary']}</p>
         </div>
-        <div class="flex items-center gap-6 shrink-0">
+        <div class="flex flex-wrap items-center gap-6 shrink-0">
           <div>
             <div class="text-gray-500">Key Support</div>
             <div class="font-bold text-gray-200">${pred['key_support']:.2f}</div>
@@ -767,6 +995,18 @@ def generate_html_dashboard(
             <div class="text-gray-500">Key Resistance</div>
             <div class="font-bold text-gray-200">${pred['key_resistance']:.2f}</div>
           </div>
+          {f'''<div>
+            <div class="text-gray-500">Put Wall (Floor)</div>
+            <div class="font-bold text-rose-400 font-mono">${pred.get("put_gamma_wall"):.2f}</div>
+          </div>''' if pred.get("put_gamma_wall") else ''}
+          {f'''<div>
+            <div class="text-gray-500">Call Wall (Pin)</div>
+            <div class="font-bold text-emerald-400 font-mono">${pred.get("call_gamma_wall"):.2f}</div>
+          </div>''' if pred.get("call_gamma_wall") else ''}
+          {f'''<div>
+            <div class="text-gray-500">Gamma Flip S*</div>
+            <div class="font-bold text-purple-300 font-mono">${pred.get("gamma_flip_price"):.2f}</div>
+          </div>''' if pred.get("gamma_flip_price") else ''}
           <div>
             <div class="text-gray-500">Stop-Loss Invalidation</div>
             <div class="font-bold text-red-400">${pred['stop_loss']:.2f}</div>
@@ -813,6 +1053,7 @@ def generate_html_dashboard(
     const BEST_BUYS = {json_best_buys};
     const PREDICTIVE = {json_predictive};
     const PERFORMANCE = {json_performance};
+    const DERIVATIVES = {json_derivatives};
 
     let currentPeriod = '5Y';
     let filteredHistory = [];
@@ -1559,6 +1800,16 @@ def generate_html_dashboard(
         ...forecastSeries.map(d => d.bull_p90),
         ...forecastSeries.map(d => d.bear_p10),
       ];
+      const currentSpot = recentHistory.length > 0 ? recentHistory[recentHistory.length - 1].close : (PREDICTIVE.current_price || 200);
+      if (PREDICTIVE.call_gamma_wall && PREDICTIVE.call_gamma_wall <= currentSpot * 1.35 && PREDICTIVE.call_gamma_wall >= currentSpot * 0.70) {{
+        allPrices.push(PREDICTIVE.call_gamma_wall);
+      }}
+      if (PREDICTIVE.put_gamma_wall && PREDICTIVE.put_gamma_wall >= currentSpot * 0.65 && PREDICTIVE.put_gamma_wall <= currentSpot * 1.30) {{
+        allPrices.push(PREDICTIVE.put_gamma_wall);
+      }}
+      if (PREDICTIVE.gamma_flip_price && PREDICTIVE.gamma_flip_price >= currentSpot * 0.65 && PREDICTIVE.gamma_flip_price <= currentSpot * 1.35) {{
+        allPrices.push(PREDICTIVE.gamma_flip_price);
+      }}
       const minPrice = Math.min(...allPrices) * 0.95;
       const maxPrice = Math.max(...allPrices) * 1.05;
 
@@ -1633,6 +1884,68 @@ def generate_html_dashboard(
         ctx.stroke();
         ctx.setLineDash([]);
       }}
+
+      // Draw Institutional Gamma Walls & Flip Level on 3-Month Canvas
+      // 1. Call Gamma Wall (Major Overhead Pin / Structural Resistance)
+      if (PREDICTIVE.call_gamma_wall) {{
+        const yCall = getY(PREDICTIVE.call_gamma_wall);
+        if (yCall >= padding.top && yCall <= padding.top + plotHeight) {{
+          ctx.strokeStyle = '#10b981';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(padding.left, yCall);
+          ctx.lineTo(width - padding.right, yCall);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          ctx.fillStyle = '#34d399';
+          ctx.font = '9px monospace';
+          ctx.textAlign = 'right';
+          ctx.fillText('Call Wall: $' + PREDICTIVE.call_gamma_wall.toFixed(2), width - padding.right - 6, yCall - 4);
+        }}
+      }}
+
+      // 2. Put Gamma Wall (Major Downside Floor / Dealer Hedging Support)
+      if (PREDICTIVE.put_gamma_wall) {{
+        const yPut = getY(PREDICTIVE.put_gamma_wall);
+        if (yPut >= padding.top && yPut <= padding.top + plotHeight) {{
+          ctx.strokeStyle = '#f43f5e';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(padding.left, yPut);
+          ctx.lineTo(width - padding.right, yPut);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          ctx.fillStyle = '#fb7185';
+          ctx.font = '9px monospace';
+          ctx.textAlign = 'right';
+          ctx.fillText('Put Wall: $' + PREDICTIVE.put_gamma_wall.toFixed(2), width - padding.right - 6, yPut - 4);
+        }}
+      }}
+
+      // 3. Gamma Flip Point S* (Zero-Gamma Volatility Inflection Trigger)
+      if (PREDICTIVE.gamma_flip_price) {{
+        const yFlip = getY(PREDICTIVE.gamma_flip_price);
+        if (yFlip >= padding.top && yFlip <= padding.top + plotHeight) {{
+          ctx.strokeStyle = '#c084fc';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath();
+          ctx.moveTo(padding.left, yFlip);
+          ctx.lineTo(width - padding.right, yFlip);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          ctx.fillStyle = '#e9d5ff';
+          ctx.font = '9px monospace';
+          ctx.textAlign = 'left';
+          ctx.fillText('Gamma Flip S*: $' + PREDICTIVE.gamma_flip_price.toFixed(2), padding.left + 6, yFlip - 4);
+        }}
+      }}
+
 
       // Draw Recent History Price Line
       ctx.strokeStyle = '#3b82f6';
@@ -1883,6 +2196,23 @@ def main():
             print(f"70% Value Area:     ${vp_info.get('val', 0):.2f} (VAL) - ${vp_info.get('vah', 0):.2f} (VAH)")
             print(f"Market Depth State: {vp_info.get('void_status')}")
 
+    deriv = analysis_data.get("derivatives")
+    if deriv and deriv.get("gex"):
+        gex_info = deriv["gex"]
+        vol_info = deriv.get("vol_surface", {})
+        print("\n-------------------------------------------------------")
+        print(" INSTITUTIONAL DERIVATIVES & DEALER GAMMA EXPOSURE (GEX)")
+        print("-------------------------------------------------------")
+        print(f"Net Dealer GEX:     ${gex_info.get('net_gex_dollar_per_1pct', 0) / 1e6:+.2f}M / 1% move ({gex_info.get('regime', 'UNKNOWN')})")
+        flip_str = f"${gex_info['gamma_flip_price']:.2f}" if gex_info.get('gamma_flip_price') else "None"
+        flip_dist = f" ({gex_info['gamma_flip_dist_pct']:+.1f}% from close)" if gex_info.get('gamma_flip_dist_pct') is not None else ""
+        print(f"Gamma Flip Point:   {flip_str}{flip_dist}")
+        print(f"Call Gamma Wall:    ${gex_info.get('call_wall_strike', 0):.2f} (Major Upside Pin / Ceiling)")
+        print(f"Put Gamma Wall:     ${gex_info.get('put_wall_strike', 0):.2f} (Major Downside Support / Floor)")
+        print(f"Max Pain Strike:    ${gex_info.get('max_pain_strike', 0):.2f}")
+        if vol_info:
+            print(f"30-Day ATM IV:      {vol_info.get('atm_iv_30d_pct', 0):.1f}% | VRP: {vol_info.get('vrp_pct', 0):+.1f}% | 25d Skew: {vol_info.get('skew_25d_rr_pct', 0):+.2f}%")
+
     proj = analysis_data.get("projections", {})
     if proj:
         print("\n-------------------------------------------------------")
@@ -1902,6 +2232,10 @@ def main():
         cp_fwd = pred.get("bocd_forward_changepoint_prob_pct")
         cp_fwd_str = f"{cp_fwd:.1f}%" if cp_fwd is not None else "N/A"
         print(f"BOCD Regime:        {pred['bocd_regime_name']} (63d Changepoint Risk: {cp_fwd_str})")
+    if pred.get("gex_regime"):
+        cw_str = f"${pred.get('call_wall_price', 0):.2f}" if pred.get('call_wall_price') else "N/A"
+        pw_str = f"${pred.get('put_wall_price', 0):.2f}" if pred.get('put_wall_price') else "N/A"
+        print(f"Dealer GEX Regime:  {pred['gex_regime']} (Call Wall: {cw_str} | Put Wall: {pw_str})")
     print(f"Action:             {pred['action_summary']}")
     print(f"Optimal Entry Zone: ${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}")
     print(f"Optimal Window:     {pred['optimal_buy_window']['description']}")
