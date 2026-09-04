@@ -88,6 +88,19 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 ]
 
+# Mapping of common index/market benchmarks to Yahoo Finance symbols
+INDEX_ALIASES: Dict[str, str] = {
+    "SPX": "^GSPC",
+    "GSPC": "^GSPC",
+    "^SPX": "^GSPC",
+    "NDX": "^NDX",
+    "DJI": "^DJI",
+    "RUT": "^RUT",
+    "VIX": "^VIX",
+    "TNX": "^TNX",
+    "TYX": "^TYX",
+}
+
 
 def load_symbols_from_file(file_path: Union[str, Path]) -> List[str]:
     """
@@ -446,16 +459,28 @@ def download_raw_symbol(
     start_ts = int(start_dt.timestamp())
     end_ts = int(end_dt.timestamp())
 
-    # 1. Primary engine: Direct Yahoo v8 chart API
-    df = fetch_yahoo_v8_chart(symbol, start_ts, end_ts, interval=interval)
-    if df is not None and not df.empty:
-        return df
+    query_symbols = [symbol]
+    sym_upper = symbol.upper()
+    if sym_upper in INDEX_ALIASES:
+        alt = INDEX_ALIASES[sym_upper]
+        if alt not in query_symbols:
+            query_symbols.append(alt)
+    elif not symbol.startswith("^"):
+        query_symbols.append(f"^{sym_upper}")
 
-    # 2. Secondary fallback engine (yfinance / yahooquery)
-    logger.info(f"Attempting fallback data fetchers for {symbol}...")
-    df_fallback = fetch_fallback_engines(symbol, start, end, interval=interval)
-    if df_fallback is not None and not df_fallback.empty:
-        return df_fallback
+    for q_sym in query_symbols:
+        # 1. Primary engine: Direct Yahoo v8 chart API
+        df = fetch_yahoo_v8_chart(q_sym, start_ts, end_ts, interval=interval)
+        if df is not None and not df.empty:
+            df["symbol"] = symbol.upper()
+            return df
+
+        # 2. Secondary fallback engine (yfinance / yahooquery)
+        logger.info(f"Attempting fallback data fetchers for {q_sym}...")
+        df_fallback = fetch_fallback_engines(q_sym, start, end, interval=interval)
+        if df_fallback is not None and not df_fallback.empty:
+            df_fallback["symbol"] = symbol.upper()
+            return df_fallback
 
     return None
 
