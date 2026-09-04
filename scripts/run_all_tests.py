@@ -26,6 +26,8 @@ CORE_SUITES = {
     "microstructure": ("Market Microstructure (AVWAP & Volume Profile)", "tests.test_microstructure"),
     "bocd": ("Bayesian Online Changepoint Detection (BOCD)", "tests.test_bocd_regime"),
     "download": ("US Selected Market Data Ingestion & Calendar", "tests.test_download_us_selected_data"),
+    "data": ("Stock Analysis JSON Data Contract Pipeline", "tests.test_stock_analysis_data"),
+    "visualize": ("Interactive Visualizer & Two-Step Pipeline", "tests.test_visualize_stock_analysis_refactor"),
 }
 
 
