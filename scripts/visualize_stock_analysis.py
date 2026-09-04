@@ -896,7 +896,11 @@ def generate_html_dashboard(
     req_date = meta.get("request_date", canonical_data.get("request_date", canonical_data.get("performance", {}).get("latest_date", "")))
     is_up_to_date = meta.get("is_up_to_date", canonical_data.get("is_up_to_date", True))
 
-    target_json_path = Path(json_path) if json_path else resolve_json_path(symbol, output=output_file, report_date=req_date)
+    target_json_path = (
+        Path(json_path).expanduser().resolve()
+        if json_path
+        else resolve_json_path(symbol, output=output_file, report_date=req_date)
+    )
     if not target_json_path.exists():
         export_analysis_json(canonical_data, target_json_path)
 
