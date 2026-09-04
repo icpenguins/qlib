@@ -257,7 +257,7 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
         payload = prepare_analysis_json_payload(self.mock_analysis)
         self.assertIn("metadata", payload)
         self.assertEqual(payload["metadata"]["symbol"], "TEST")
-        self.assertEqual(payload["metadata"]["contract_version"], "1.0.0")
+        self.assertEqual(payload["metadata"]["contract_version"], "1.2.0")
         self.assertIn("historical_data", payload)
         self.assertIsInstance(payload["historical_data"], list)
         self.assertTrue(len(payload["historical_data"]) > 0)

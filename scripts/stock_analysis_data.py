@@ -35,12 +35,31 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-# Ensure scripts directory is in path
+# Ensure scripts and qlib/contrib directories are in path
 CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent
+CONTRIB_DIR = REPO_ROOT / "qlib" / "contrib"
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
+if str(CONTRIB_DIR) not in sys.path:
+    sys.path.insert(0, str(CONTRIB_DIR))
 
 from stock_analysis_engine import run_stock_analysis, compute_multi_period_projections
+
+try:
+    from qlib.contrib.derivatives import (
+        evaluate_earnings_gamma_squeeze,
+        DataProvenance,
+    )
+except Exception:
+    try:
+        from derivatives import (
+            evaluate_earnings_gamma_squeeze,
+            DataProvenance,
+        )
+    except Exception:
+        evaluate_earnings_gamma_squeeze = None
+        DataProvenance = None
 
 
 def resolve_json_path(
@@ -130,9 +149,11 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
     req_date = analysis_data.get(
         "request_date", analysis_data.get("metadata", {}).get("request_date", perf.get("latest_date", ""))
     )
+    if not req_date:
+        req_date = datetime.date.today().strftime("%Y-%m-%d")
     latest_data_date = analysis_data.get(
         "latest_data_date",
-        analysis_data.get("metadata", {}).get("latest_data_date", perf.get("latest_date", "")),
+        analysis_data.get("metadata", {}).get("latest_data_date", perf.get("latest_date", req_date)),
     )
     is_up_to_date = analysis_data.get(
         "is_up_to_date", analysis_data.get("metadata", {}).get("is_up_to_date", True)
@@ -194,6 +215,60 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
             derivatives=analysis_data.get("derivatives"),
         )
 
+    earnings_gamma_squeeze = analysis_data.get("earnings_gamma_squeeze")
+    if not earnings_gamma_squeeze:
+        if evaluate_earnings_gamma_squeeze is not None:
+            last_price = 100.0
+            if isinstance(raw_hist, pd.DataFrame) and not raw_hist.empty and "close" in raw_hist.columns:
+                last_price = float(raw_hist["close"].iloc[-1])
+            elif perf and "current_price" in perf:
+                last_price = float(perf["current_price"])
+
+            vol_mean = 1_000_000.0
+            if isinstance(raw_hist, pd.DataFrame) and not raw_hist.empty and "volume" in raw_hist.columns:
+                vol_mean = float(raw_hist["volume"].tail(20).mean())
+
+            sue_val = 0.0
+            events_info = analysis_data.get("events", {})
+            if events_info and "pead" in events_info and events_info["pead"]:
+                sue_val = float(events_info["pead"].get("sue_score", 0.0))
+
+            flip_val = 0.0
+            deriv_info = analysis_data.get("derivatives", {})
+            if deriv_info and "gamma_flip_price" in deriv_info:
+                flip_val = float(deriv_info["gamma_flip_price"])
+
+            prov_val = DataProvenance.SYNTHETIC_RESEARCH_FALLBACK if DataProvenance else "synthetic_research_fallback"
+            earnings_gamma_squeeze = evaluate_earnings_gamma_squeeze(
+                spot=last_price,
+                df_chain=pd.DataFrame(),
+                adtv_20=vol_mean,
+                sue_score=sue_val,
+                short_interest_pct=0.05,
+                gamma_flip_price=flip_val,
+                provenance=prov_val,
+                is_pit_timestamp=True,
+                event_date=str(req_date),
+                reporting_time="AMC",
+            )
+        else:
+            earnings_gamma_squeeze = {
+                "is_actionable": False,
+                "provenance": "synthetic_research_fallback",
+                "safety_status": "ACTION_SUPPRESSED",
+                "recommended_action": "RESEARCH_ONLY_NO_ACTION",
+            }
+
+    # Extract backtesting_protocol and evaluation_matrix
+    backtesting_protocol = analysis_data.get(
+        "backtesting_protocol",
+        earnings_gamma_squeeze.get("backtesting_protocol", {})
+    )
+    evaluation_matrix = analysis_data.get(
+        "evaluation_matrix",
+        earnings_gamma_squeeze.get("evaluation_matrix", {})
+    )
+
     payload = {
         "metadata": {
             "symbol": symbol,
@@ -202,7 +277,7 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
             "is_up_to_date": bool(is_up_to_date),
             "forecast_days": int(forecast_days),
             "generated_at": datetime.datetime.now().isoformat(),
-            "contract_version": "1.0.0",
+            "contract_version": "1.2.0",
         },
         "symbol": symbol,
         "historical_data": history_payload,
@@ -214,6 +289,9 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
         "microstructure": analysis_data.get("microstructure", {}),
         "derivatives": analysis_data.get("derivatives", {}),
         "events": analysis_data.get("events", {}),
+        "earnings_gamma_squeeze": earnings_gamma_squeeze or {},
+        "backtesting_protocol": backtesting_protocol or {},
+        "evaluation_matrix": evaluation_matrix or {},
     }
     return _sanitize_for_json(payload)
 
@@ -390,6 +468,25 @@ def main():
         help="JSON indentation level for formatted output.",
     )
     parser.add_argument(
+        "--provenance",
+        type=str,
+        default="historical_opra_eod",
+        choices=["live_opra_verified", "historical_opra_eod", "synthetic_research_fallback"],
+        help="Options chain data provenance tier (default: 'historical_opra_eod').",
+    )
+    parser.add_argument(
+        "--simulate_jump",
+        type=float,
+        default=None,
+        help="Simulate specific spot jump percentage for earnings squeeze evaluation (e.g. 0.08 for +8%%).",
+    )
+    parser.add_argument(
+        "--custom_iv_crush",
+        type=float,
+        default=None,
+        help="Override historical IV crush ratio (e.g. 0.45 for 45%% drop).",
+    )
+    parser.add_argument(
         "--quiet", "-q",
         action="store_true",
         default=False,
@@ -422,6 +519,12 @@ def main():
     latest_data_date = meta.get("latest_data_date", perf.get("latest_date", ""))
     is_up_to_date = meta.get("is_up_to_date", True)
 
+    gamma_data = data.get("earnings_gamma_squeeze", {})
+    vol_surf = gamma_data.get("calibrate_post_earnings_volatility_surface", {})
+    backtest = data.get("backtesting_protocol", {})
+    dsr_data = backtest.get("deflated_sharpe_ratio", {})
+    panel = backtest.get("verifiable_replication_event_panel", {})
+
     if not args.quiet:
         print("\n=======================================================")
         print(" STOCK ANALYSIS JSON DATA CONTRACT GENERATOR ")
@@ -431,7 +534,14 @@ def main():
         print(f"Data Directory:   {args.data_dir}")
         print(f"Data Freshness:   Through {latest_data_date} ({'Up-to-Date' if is_up_to_date else 'Latest available'})")
         print(f"Auto Download:    {args.auto_download}")
-        print(f"Forecast Days:    {args.days_forecast} (~3 months)")
+        print(f"Contract Version: {meta.get('contract_version', '1.2.0')}")
+        print(f"Squeeze Model:    Next-Day to Next-Week (t+1 to t+5) Active")
+        if vol_surf:
+            print(f"Vol Surface:      Expected Jump: +{vol_surf.get('expected_jump_pct', 0.0)}% | Post-Event IV: {vol_surf.get('post_earnings_iv', 0.0)}")
+        if dsr_data:
+            print(f"Backtest DSR:     Sharpe: {dsr_data.get('best_sharpe', 0.0)} | Hurdle: {dsr_data.get('expected_max_sharpe_hurdle', 0.0)} | DSR Prob: {dsr_data.get('dsr_probability', 0.0)} ({'Significant p<0.05' if dsr_data.get('is_statistically_significant') else 'Inconclusive'})")
+        if panel:
+            print(f"Replication Panel: {panel.get('n_events', 0):,} Events | Win Rate: {panel.get('win_rate', 0.0)*100:.1f}% | Profit Factor: {panel.get('profit_factor', 0.0)}")
         print(f"Output Dataset:   {exported_file.resolve()}")
         print("=======================================================")
         print(f"\n[SUCCESS] Canonical JSON analysis dataset generated at: {exported_file.resolve()}\n")

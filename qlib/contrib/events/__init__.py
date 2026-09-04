@@ -20,6 +20,8 @@ from .event_calendar import (
 from .pead import PEADEngine
 from .risk_degrossing import RiskDegrossingEngine
 from .events_data import EventsDataLoader, SyntheticEventScheduleGenerator
+from .empirical_sue import calculate_empirical_sue
+from .earnings_event_clock import EarningsEventClock, InvalidEventExecutionError, resolve_earnings_event_execution
 
 
 def compute_event_risk_features(
@@ -121,4 +123,8 @@ __all__ = [
     "EventsDataLoader",
     "SyntheticEventScheduleGenerator",
     "compute_event_risk_features",
+    "calculate_empirical_sue",
+    "EarningsEventClock",
+    "InvalidEventExecutionError",
+    "resolve_earnings_event_execution",
 ]

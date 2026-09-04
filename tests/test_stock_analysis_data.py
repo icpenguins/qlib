@@ -278,7 +278,7 @@ class TestStockAnalysisData(unittest.TestCase):
         # Metadata verification
         self.assertIn("metadata", payload)
         meta = payload["metadata"]
-        self.assertEqual(meta["contract_version"], "1.0.0")
+        self.assertEqual(meta["contract_version"], "1.2.0")
         self.assertEqual(meta["symbol"], "AAPL")
         self.assertEqual(meta["request_date"], "2025-10-31")
         self.assertEqual(meta["latest_data_date"], "2025-10-31")
@@ -306,6 +306,23 @@ class TestStockAnalysisData(unittest.TestCase):
         self.assertIn("microstructure", payload)
         self.assertIn("derivatives", payload)
         self.assertIn("events", payload)
+        self.assertIn("earnings_gamma_squeeze", payload)
+        self.assertIn("backtesting_protocol", payload)
+        self.assertIn("evaluation_matrix", payload)
+
+        # Nested institutional keys inside earnings_gamma_squeeze
+        egs = payload["earnings_gamma_squeeze"]
+        self.assertIn("calibrate_post_earnings_volatility_surface", egs)
+        self.assertIn("factor_orthogonalization", egs)
+        self.assertIn("earnings_event_clock", egs)
+
+        # Institutional backtesting protocol checks
+        bp = payload["backtesting_protocol"]
+        self.assertIn("purged_walk_forward_cv", bp)
+        self.assertIn("almgren_chriss_market_impact", bp)
+        self.assertIn("borrow_fee_engine", bp)
+        self.assertIn("deflated_sharpe_ratio", bp)
+        self.assertIn("verifiable_replication_event_panel", bp)
 
     def test_export_and_load_json_roundtrip(self):
         """Test disk serialization and deserialization."""
@@ -320,7 +337,7 @@ class TestStockAnalysisData(unittest.TestCase):
             # Load
             loaded = load_analysis_json(json_file)
             self.assertEqual(loaded["metadata"]["symbol"], "AAPL")
-            self.assertEqual(loaded["metadata"]["contract_version"], "1.0.0")
+            self.assertEqual(loaded["metadata"]["contract_version"], "1.2.0")
             self.assertEqual(loaded["predictive"]["recommendation"], "STRONG BUY")
             self.assertEqual(loaded["derivatives"]["regime"], "+GEX (Dealer Long Gamma / Volatility Dampening)")
 
@@ -390,6 +407,10 @@ class TestStockAnalysisData(unittest.TestCase):
             data = load_analysis_json(expected_json)
             self.assertEqual(data["metadata"]["symbol"], "TEST")
             self.assertEqual(data["metadata"]["request_date"], "2025-10-31")
+            self.assertEqual(data["metadata"]["contract_version"], "1.2.0")
+            self.assertIn("backtesting_protocol", data)
+            self.assertIn("evaluation_matrix", data)
+            self.assertIn("calibrate_post_earnings_volatility_surface", data["earnings_gamma_squeeze"])
 
 
 if __name__ == "__main__":

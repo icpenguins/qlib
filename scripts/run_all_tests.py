@@ -28,6 +28,12 @@ CORE_SUITES = {
     "download": ("US Selected Market Data Ingestion & Calendar", "tests.test_download_us_selected_data"),
     "data": ("Stock Analysis JSON Data Contract Pipeline", "tests.test_stock_analysis_data"),
     "visualize": ("Interactive Visualizer & Two-Step Pipeline", "tests.test_visualize_stock_analysis_refactor"),
+    "squeeze": ("Earnings Gamma Squeeze & Forced Dealer Hedging", "tests.test_earnings_gamma_squeeze_engine"),
+    "cv": ("Purged Walk-Forward CV & Event Embargo", "tests.test_purged_walk_forward_cv"),
+    "impact": ("Almgren-Chriss Market Impact Engine", "tests.test_almgren_chriss_market_impact"),
+    "htb": ("Hard-To-Borrow & Locate Capacity Engine", "tests.test_htb_borrow_fees"),
+    "dsr": ("Deflated Sharpe Ratio & Multiple Testing Correction", "tests.test_deflated_sharpe_ratio"),
+    "clock": ("Earnings Event Clock & AMC/BMO Discipline", "tests.test_earnings_event_clock"),
 }
 
 
