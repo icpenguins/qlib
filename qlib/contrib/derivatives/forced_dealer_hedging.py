@@ -81,12 +81,12 @@ def calculate_forced_dealer_hedging_demand(
         delta_new_c = BlackScholesGreeks.calc_delta(S_new, strikes, tau_new, sigma_new, is_call=True)
         delta_new_p = BlackScholesGreeks.calc_delta(S_new, strikes, tau_new, sigma_new, is_call=False)
 
-        # Forced dealer re-hedging demand: dealers are short customer calls and long customer puts
+        # Forced dealer re-hedging demand: dealers are net short customer calls and short customer puts
         # As stock rises, customer call delta increases -> dealers must BUY stock to stay delta neutral
         # Customer put delta becomes less negative -> dealers must BUY back existing short stock hedges
         shares_call = np.sum(100.0 * ois_call * (delta_new_c - delta_0_c))
         shares_put = np.sum(100.0 * ois_put * (delta_new_p - delta_0_p))
-        net_shares_demand = float(shares_call - shares_put)
+        net_shares_demand = float(shares_call + shares_put)
 
         effective_liquidity = max(1.0, adtv_20 * depth_factor)
         lir = abs(net_shares_demand) / effective_liquidity

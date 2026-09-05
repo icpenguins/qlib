@@ -733,6 +733,42 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
             self.assertNotIn("Execute limit buy at 09:30 AM open", html_text)
             self.assertNotIn("Immediate Market Open limit entry", html_text)
 
+    def test_gamma_squeeze_card_synthetic_and_corridor_invariants(self):
+        # 1. Synthetic provenance test: verify theoretical metrics displayed without zeroing
+        synth_gamma = dict(self.mock_analysis["earnings_gamma_squeeze"])
+        synth_gamma["provenance"] = "synthetic_research_fallback"
+        synth_gamma["is_actionable"] = False
+        synth_gamma["safety_status"] = "ACTION_SUPPRESSED"
+        synth_gamma["gsi_scores"] = {
+            "gsi_positive_raw": 83.91,
+            "gsi_positive": 83.91,
+            "is_positive_squeeze_candidate": True,
+        }
+        synth_gamma["calibrated_probabilities"] = {
+            "p_positive_squeeze": 0.845,
+            "calibrated_prob_squeeze": 84.5,
+        }
+        # Inverted corridor mock: trigger strike $524.69 above wall $517.39
+        synth_gamma["acceleration_corridors"] = {
+            "trigger_strike": 524.69,
+            "upper_squeeze_wall": 517.39,
+            "lower_gamma_trap": 480.0,
+        }
+        spot = 499.70
+        html = build_gamma_squeeze_spike_card_html(synth_gamma, spot_price=spot)
+
+        # Theoretical simulation banner
+        self.assertIn("THEORETICAL SPIKE SETUP (ACTION SUPPRESSED: SYNTHETIC DATA)", html)
+        self.assertIn("SIMULATION", html)
+        # Metrics not zeroed: 84.5% and 83.9
+        self.assertIn("84.5%", html)
+        self.assertIn("83.9 / 100", html)
+        # Corridor geometry invariant enforced: Trigger Strike must NOT be 524.69 above 517.39
+        # Clamped trigger = round(499.70 + 0.35 * (517.39 - 499.70), 2) = $505.89
+        self.assertIn("$505.89", html)
+        self.assertIn("$517.39", html)
+        self.assertNotIn("$524.69", html)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,10 +99,46 @@ class TestEarningsGammaSqueezeEngine(unittest.TestCase):
         self.assertFalse(res["is_actionable"])
         self.assertEqual(res["safety_status"], "ACTION_SUPPRESSED")
         self.assertEqual(res["recommended_action"], "RESEARCH_ONLY_NO_ACTION")
-        self.assertIsNone(res["calibrated_probabilities"]["p_positive_squeeze"])
+        # Quantitative Transparency: Synthetic research data computes theoretical probabilities
+        self.assertIsNotNone(res["calibrated_probabilities"]["p_positive_squeeze"])
+        self.assertGreater(res["calibrated_probabilities"]["p_positive_squeeze"], 0.0)
+        self.assertIn("calibrated_prob_squeeze", res["calibrated_probabilities"])
+        self.assertIn("gsi_positive", res["gsi_scores"])
+        self.assertEqual(res["gsi_scores"]["gsi_positive"], res["gsi_scores"]["gsi_positive_raw"])
         # Invariant: Backtesting protocol is still available for academic reference
         self.assertIn("backtesting_protocol", res)
         self.assertIn("deflated_sharpe_ratio", res["backtesting_protocol"])
+
+    def test_corridor_geometric_ordering_invariant(self):
+        # Strict Invariant: Spot < Trigger Strike < Upper Squeeze Wall
+        # Downside Invariant: Lower Trapdoor < Downside Trigger < Spot
+        for test_spot in [100.0, 499.70, 750.25]:
+            res = evaluate_earnings_gamma_squeeze(
+                spot=test_spot,
+                df_chain=pd.DataFrame(),  # Tests synthetic chain fallback
+                adtv_20=self.adtv,
+                sue_score=1.5,
+                short_interest_pct=0.08,
+                provenance=DataProvenance.SYNTHETIC_RESEARCH_FALLBACK,
+                is_pit_timestamp=True,
+            )
+            corridors = res["acceleration_corridors"]
+            trigger = corridors["trigger_strike"]
+            wall = corridors["upper_squeeze_wall"]
+            trap = corridors["lower_trapdoor"]
+            trigger_down = corridors["downside_trigger"]
+
+            self.assertLess(test_spot, trigger, f"Failed: Spot {test_spot} < Trigger {trigger}")
+            self.assertLess(trigger, wall, f"Failed: Trigger {trigger} < Wall {wall}")
+            self.assertLess(trap, trigger_down, f"Failed: Trap {trap} < TriggerDown {trigger_down}")
+            self.assertLess(trigger_down, test_spot, f"Failed: TriggerDown {trigger_down} < Spot {test_spot}")
+
+            # Also verify forced dealer hedging has non-zero shares and dollar demand
+            fd = res["forced_dealer_hedging"]
+            self.assertIn("dealer_shares_to_buy", fd)
+            self.assertIn("dealer_dollar_demand", fd)
+            self.assertGreater(fd["dealer_shares_to_buy"], 0)
+            self.assertGreater(fd["dealer_dollar_demand"], 0.0)
 
 
 if __name__ == "__main__":

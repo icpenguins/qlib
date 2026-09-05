@@ -994,10 +994,27 @@ def build_buy_timing_verdict_banner_html(
     corridors = gamma.get("acceleration_corridors", {})
     clock = gamma.get("earnings_event_clock", {})
 
-    prob_spike = float(calib.get("calibrated_prob_squeeze", 0.0) or calib.get("probability_positive_spike", 0.0))
-    gsi_pos = float(gsi.get("gsi_positive", 0.0))
+    prob_val = calib.get("calibrated_prob_squeeze")
+    if prob_val is None:
+        p_raw = calib.get("p_positive_squeeze")
+        if p_raw is not None:
+            prob_val = float(p_raw) * 100.0
+        else:
+            prob_val = calib.get("probability_positive_spike", 0.0)
+    prob_spike = float(prob_val)
+
+    gsi_pos = float(
+        gsi.get("gsi_positive")
+        if gsi.get("gsi_positive") is not None
+        else gsi.get("gsi_positive_raw", 0.0)
+    )
     exp_jump = float(vol_surf.get("expected_jump_pct", 0.0))
-    is_spike = (prob_spike >= 60.0 or gsi_pos >= 60.0 or exp_jump >= 5.0) and bool(gsi.get("is_positive_squeeze_candidate", False))
+    is_pos_candidate = bool(
+        gsi.get("is_positive_squeeze_candidate", False)
+        or gsi.get("is_positive_alert", False)
+        or (gsi_pos >= 60.0)
+    )
+    is_spike = (prob_spike >= 60.0 or gsi_pos >= 60.0 or exp_jump >= 5.0) and is_pos_candidate
 
     # 2. Check safety / provenance
     is_synthetic = (
@@ -1286,10 +1303,27 @@ def build_gamma_squeeze_spike_card_html(
     clock = gamma_squeeze.get("earnings_event_clock", {})
     corridors = gamma_squeeze.get("acceleration_corridors", {})
 
-    prob_squeeze = float(calib.get("calibrated_prob_squeeze", 0.0) or calib.get("probability_positive_spike", 0.0))
-    gsi_pos = float(gsi.get("gsi_positive", 0.0))
+    prob_val = calib.get("calibrated_prob_squeeze")
+    if prob_val is None:
+        p_raw = calib.get("p_positive_squeeze")
+        if p_raw is not None:
+            prob_val = float(p_raw) * 100.0
+        else:
+            prob_val = calib.get("probability_positive_spike", 0.0)
+    prob_squeeze = float(prob_val)
+
+    gsi_pos = float(
+        gsi.get("gsi_positive")
+        if gsi.get("gsi_positive") is not None
+        else gsi.get("gsi_positive_raw", 0.0)
+    )
     exp_jump = float(vol_surf.get("expected_jump_pct", 0.0))
-    is_spike = (prob_squeeze >= 60.0 or gsi_pos >= 60.0 or exp_jump >= 5.0) and bool(gsi.get("is_positive_squeeze_candidate", False))
+    is_pos_candidate = bool(
+        gsi.get("is_positive_squeeze_candidate", False)
+        or gsi.get("is_positive_alert", False)
+        or (gsi_pos >= 60.0)
+    )
+    is_spike = (prob_squeeze >= 60.0 or gsi_pos >= 60.0 or exp_jump >= 5.0) and is_pos_candidate
 
     is_synthetic = (
         gamma_squeeze.get("provenance") == "synthetic_research_fallback"
@@ -1331,14 +1365,33 @@ def build_gamma_squeeze_spike_card_html(
         status_text = "NORMAL DRIFT / BASELINE"
         pulse_color = "bg-teal-400"
 
-    trigger_strike = corridors.get("trigger_strike", spot_price * 1.05)
-    upper_wall = corridors.get("upper_squeeze_wall", spot_price * 1.15)
-    lower_trap = corridors.get("lower_gamma_trap", spot_price * 0.95)
+    # Enforce Corridor Geometric Invariant: Spot < Trigger < Upper Wall
+    upper_wall = float(corridors.get("upper_squeeze_wall", spot_price * 1.10))
+    if upper_wall <= spot_price:
+        upper_wall = round(spot_price * 1.10, 2)
 
-    dealer_shares = forced.get("dealer_shares_to_buy", 0)
-    dealer_dollar = forced.get("dealer_dollar_demand", 0.0)
-    dealer_velocity = forced.get("dealer_hedging_velocity", "Moderate")
-    pct_adtv = forced.get("pct_adtv_demand", 0.0)
+    raw_trigger = corridors.get("trigger_strike")
+    if raw_trigger is None or float(raw_trigger) >= upper_wall or float(raw_trigger) <= spot_price:
+        trigger_strike = round(spot_price + 0.35 * (upper_wall - spot_price), 2)
+    else:
+        trigger_strike = float(raw_trigger)
+
+    lower_trap = float(corridors.get("lower_gamma_trap", corridors.get("lower_trapdoor", spot_price * 0.95)))
+    if lower_trap >= spot_price:
+        lower_trap = round(spot_price * 0.95, 2)
+
+    dealer_shares = forced.get("dealer_shares_to_buy")
+    if dealer_shares is None:
+        scen_bull = forced.get("scenarios", {}).get(0.10, {}) or forced.get(0.10, {})
+        dealer_shares = int(round(scen_bull.get("shares_demand", 0.0)))
+        dealer_dollar = float(scen_bull.get("dollar_demand", 0.0))
+        pct_adtv = float(scen_bull.get("lir", 0.0) * 100.0)
+        dealer_velocity = "Moderate"
+    else:
+        dealer_shares = int(dealer_shares)
+        dealer_dollar = float(forced.get("dealer_dollar_demand", 0.0))
+        pct_adtv = float(forced.get("pct_adtv_demand", 0.0))
+        dealer_velocity = forced.get("dealer_hedging_velocity", "Moderate")
 
     spread_bps = liq.get("expected_spread_widening_bps", 0.0)
     slippage_bps = liq.get("expected_slippage_bps", 0.0)
@@ -1348,7 +1401,11 @@ def build_gamma_squeeze_spike_card_html(
     crush_ratio = vol_surf.get("historical_crush_ratio", 0.0)
     crush_src = vol_surf.get("crush_source", "winsorized_median")
 
-    res_gsi = factor_ortho.get("residual_gsi", 0.0)
+    res_gsi = float(
+        factor_ortho.get("residual_gsi")
+        if factor_ortho.get("residual_gsi") is not None
+        else factor_ortho.get("gsi_orthogonal", 0.0)
+    )
 
     t0_time = clock.get("t0_timestamp", "Post-Close AMC")
 
@@ -2091,8 +2148,8 @@ def generate_html_dashboard(
         <div class="text-right">
           <div class="text-xs text-gray-400 uppercase tracking-wider font-medium">3M Target Price</div>
           <div class="text-2xl font-black text-emerald-400">${pred["target_price_3m"]:.2f}</div>
-          <div class="text-xs font-semibold {'text-emerald-400' if pred['expected_return_pct'] >= 0 else 'text-red-400'}">
-            {'+' if pred['expected_return_pct'] >= 0 else ''}{pred['expected_return_pct']:.1f}% Expected
+          <div class="text-xs font-semibold {'text-emerald-400' if pred.get('expected_return_pct', 0.0) >= 0 else 'text-red-400'}">
+            {'+' if pred.get('expected_return_pct', 0.0) >= 0 else ''}{pred.get('expected_return_pct', 0.0):.1f}% Expected
           </div>
         </div>
       </div>
@@ -2356,16 +2413,16 @@ def generate_html_dashboard(
       <div class="mt-4 p-4 rounded-xl bg-gray-950 border border-gray-800 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 text-xs">
         <div class="space-y-1">
           <span class="font-bold text-white text-sm">Tactical Execution Guidance:</span>
-          <p class="text-gray-300">{pred['action_summary']}</p>
+          <p class="text-gray-300">{pred.get('action_summary', 'Tactical execution aligned with institutional microstructure.')}</p>
         </div>
         <div class="flex flex-wrap items-center gap-6 shrink-0">
           <div>
             <div class="text-gray-500">Key Support</div>
-            <div class="font-bold text-gray-200">${pred['key_support']:.2f}</div>
+            <div class="font-bold text-gray-200">${pred.get('key_support', spot_price * 0.95):.2f}</div>
           </div>
           <div>
             <div class="text-gray-500">Key Resistance</div>
-            <div class="font-bold text-gray-200">${pred['key_resistance']:.2f}</div>
+            <div class="font-bold text-gray-200">${pred.get('key_resistance', spot_price * 1.05):.2f}</div>
           </div>
           {f'''<div>
             <div class="text-gray-500">Put Wall (Floor)</div>

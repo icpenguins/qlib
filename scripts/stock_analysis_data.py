@@ -284,9 +284,21 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
                 flip_val = float(deriv_info["gamma_flip_price"])
 
             prov_val = DataProvenance.SYNTHETIC_RESEARCH_FALLBACK if DataProvenance else "synthetic_research_fallback"
+            chain_to_pass = pd.DataFrame()
+            if SyntheticOptionSurfaceGenerator is not None:
+                try:
+                    chain_to_pass = SyntheticOptionSurfaceGenerator.generate_synthetic_chain(
+                        spot_price=last_price,
+                        annual_vol=0.25,
+                        dte_days=30,
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not generate synthetic chain: {e}")
+                    chain_to_pass = pd.DataFrame()
+
             earnings_gamma_squeeze = evaluate_earnings_gamma_squeeze(
                 spot=last_price,
-                df_chain=pd.DataFrame(),
+                df_chain=chain_to_pass,
                 adtv_20=vol_mean,
                 sue_score=sue_val,
                 short_interest_pct=0.05,
