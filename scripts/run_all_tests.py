@@ -34,6 +34,10 @@ CORE_SUITES = {
     "htb": ("Hard-To-Borrow & Locate Capacity Engine", "tests.test_htb_borrow_fees"),
     "dsr": ("Deflated Sharpe Ratio & Multiple Testing Correction", "tests.test_deflated_sharpe_ratio"),
     "clock": ("Earnings Event Clock & AMC/BMO Discipline", "tests.test_earnings_event_clock"),
+    "alpha158": ("LightGBM Alpha158 US Russell 1000 Pipeline", "tests.test_lightgbm_alpha158_us"),
+    "indicators": ("Shared Technical Indicators & Vectorized Math", "tests.test_indicators"),
+    "models": ("Domain Models & Typed Data Transfer Objects", "tests.test_domain_models"),
+    "predictive": ("Decomposed Predictive Engine & Collaborating Services", "tests.test_predictive_engine"),
 }
 
 

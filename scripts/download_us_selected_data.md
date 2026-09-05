@@ -16,12 +16,13 @@ Targeted US stock data downloader, Qlib-compliant normalizer, and binary dumper 
    - Computes split and dividend adjustment factor: $\text{factor} = \frac{\text{adj\_close}}{\text{close}}$.
    - Adjusts volume: $\text{adjusted\_volume} = \frac{\text{volume}}{\text{factor}}$.
    - Calculates daily percentage change: $\text{change} = \frac{\text{close}_t - \text{close}_{t-1}}{\text{close}_{t-1}}$.
+   - Calculates VWAP (Volume Weighted Average Price) approximation: $\text{vwap} = \frac{\text{high} + \text{low} + \text{close}}{3}$ for full Alpha158 feature compliance.
    - Standardizes timestamps and sorts chronologically.
 3. **Qlib Binary Serialization**:
-   - Writes float32 little-endian (`<f`) arrays to `features/<SYMBOL>/<field>.day.bin`.
+   - Writes float32 little-endian (`<f`) arrays to `features/<SYMBOL>/<field>.day.bin` (`open`, `high`, `low`, `close`, `volume`, `factor`, `change`, and `vwap`).
    - Generates unified market calendars (`calendars/day.txt`).
    - Updates instrument index metadata (`instruments/all.txt`).
-   - Makes datasets immediately ready for `qlib.init(provider_uri=...)` or `stock_analysis_engine.py`.
+   - Makes datasets immediately ready for `qlib.init(provider_uri=...)`, Alpha158 LightGBM training, or `stock_analysis_engine.py`.
 
 ---
 

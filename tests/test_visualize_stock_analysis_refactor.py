@@ -554,7 +554,7 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
         # Fallback calibration when derivatives is None but spot_price > 0
         fallback_deriv_html = build_derivatives_card_html(None, spot_price=140.0)
         self.assertIn("Institutional Derivatives &amp; Dealer Gamma Exposure (GEX)", fallback_deriv_html)
-        self.assertIn("CALIBRATED SYNTHETIC SURFACE", fallback_deriv_html)
+        self.assertIn("SYNTHETIC RESEARCH CHAIN", fallback_deriv_html)
         self.assertIn("Gamma Flip Point", fallback_deriv_html)
 
         # 5. Events

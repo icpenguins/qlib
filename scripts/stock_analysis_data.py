@@ -74,6 +74,14 @@ except Exception:
         SyntheticOptionSurfaceGenerator = None
         VolatilitySurfaceFeatures = None
 
+try:
+    from scripts.infer_alpha158 import Alpha158Scorer
+except Exception:
+    try:
+        from infer_alpha158 import Alpha158Scorer
+    except Exception:
+        Alpha158Scorer = None
+
 
 def resolve_json_path(
     symbol: str,
@@ -333,6 +341,13 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
         earnings_gamma_squeeze.get("evaluation_matrix", {})
     )
 
+    alpha158_data = analysis_data.get("alpha158")
+    if not alpha158_data and Alpha158Scorer is not None:
+        try:
+            alpha158_data = Alpha158Scorer().get_score(symbol, as_of_date=str(latest_data_date))
+        except Exception:
+            pass
+
     payload = {
         "metadata": {
             "symbol": symbol,
@@ -356,6 +371,7 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
         "earnings_gamma_squeeze": earnings_gamma_squeeze or {},
         "backtesting_protocol": backtesting_protocol or {},
         "evaluation_matrix": evaluation_matrix or {},
+        "alpha158": alpha158_data or {},
     }
     return _sanitize_for_json(payload)
 

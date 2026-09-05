@@ -548,11 +548,17 @@ def normalize_symbol_data(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df["change"] = df["close"].pct_change()
     df.loc[df.index[0], "change"] = 0.0
 
+    # 5. Calculate VWAP (Volume Weighted Average Price approximation for 1D bars: (high + low + close) / 3)
+    if all(c in df.columns for c in ["high", "low", "close"]):
+        df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    elif "close" in df.columns:
+        df["vwap"] = df["close"]
+
     # Format date back to string
     df["date"] = df["date"].dt.strftime("%Y-%m-%d")
     df["symbol"] = symbol.upper()
 
-    output_cols = ["date", "symbol", "open", "high", "low", "close", "volume", "factor", "change"]
+    output_cols = ["date", "symbol", "open", "high", "low", "close", "volume", "factor", "change", "vwap"]
     avail_cols = [c for c in output_cols if c in df.columns]
     return df[avail_cols]
 
@@ -616,12 +622,25 @@ def dump_to_qlib_format(
             f.write(f"{d}\n")
     logger.info(f"Saved calendar with {len(calendar_list)} trading days to {cal_file}")
 
+    # Also save future calendar for Qlib backtest executor (which requires calendar_index + 1)
+    future_cal_file = cal_dir.joinpath(f"{freq}_future.txt")
+    try:
+        last_date = pd.Timestamp(calendar_list[-1])
+        future_dates = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start=last_date, periods=504)]
+        combined_cal = sorted(set(calendar_list + future_dates))
+        with open(future_cal_file, "w", encoding="utf-8") as f:
+            for d in combined_cal:
+                f.write(f"{d}\n")
+        logger.info(f"Saved future calendar with {len(combined_cal)} days to {future_cal_file}")
+    except Exception as e:
+        logger.warning(f"Failed to generate future calendar: {e}")
+
     # Map each date string to its index in calendar_list
     date_to_idx = {d: idx for idx, d in enumerate(calendar_list)}
 
     # 2. Dump features and instruments
     instruments_data = []
-    feature_fields = ["open", "high", "low", "close", "volume", "factor", "change"]
+    feature_fields = ["open", "high", "low", "close", "volume", "factor", "change", "vwap"]
 
     for symbol, df in normalized_dfs.items():
         if df.empty:
