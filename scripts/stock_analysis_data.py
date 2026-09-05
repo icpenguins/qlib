@@ -237,7 +237,12 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
                     logger.debug(f"compute_dealer_gex_features fallback: {e}")
             if not derivatives and DealerGammaEngine is not None and SyntheticOptionSurfaceGenerator is not None:
                 try:
-                    chain = SyntheticOptionSurfaceGenerator.generate_synthetic_chain(spot_price=spot_val)
+                    adtv_val = float(raw_hist["volume"].tail(20).mean()) if isinstance(raw_hist, pd.DataFrame) and "volume" in raw_hist.columns else None
+                    chain = SyntheticOptionSurfaceGenerator.generate_synthetic_chain(
+                        spot_price=spot_val,
+                        symbol=symbol,
+                        adtv=adtv_val,
+                    )
                     engine = DealerGammaEngine()
                     derivatives = engine.compute_gex(chain, spot_price=spot_val)
                     if VolatilitySurfaceFeatures is not None:
@@ -291,6 +296,8 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
                         spot_price=last_price,
                         annual_vol=0.25,
                         dte_days=30,
+                        symbol=symbol,
+                        adtv=vol_mean,
                     )
                 except Exception as e:
                     logger.warning(f"Could not generate synthetic chain: {e}")

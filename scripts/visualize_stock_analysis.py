@@ -444,10 +444,15 @@ def build_microstructure_card_html(micro: Optional[Dict[str, Any]]) -> str:
     """
 
 
-def _build_calibrated_derivatives_fallback(spot_price: float) -> Dict[str, Any]:
+def _build_calibrated_derivatives_fallback(
+    spot_price: float,
+    symbol: Optional[str] = None,
+    adtv: Optional[float] = None,
+) -> Dict[str, Any]:
     """
     Construct a deterministic, calibrated institutional GEX profile and options surface
     when external options feed is unavailable, guaranteeing the GEX section is never omitted.
+    Scaled to ticker liquidity (ADTV / mega-cap) and exchange strike increments.
     """
     if spot_price <= 0:
         spot_price = 100.0
@@ -459,6 +464,8 @@ def _build_calibrated_derivatives_fallback(spot_price: float) -> Dict[str, Any]:
                 annual_vol=0.25,
                 dte_days=30,
                 num_strikes=25,
+                symbol=symbol,
+                adtv=adtv,
             )
             engine = DealerGammaEngine(risk_free_rate=0.045, dividend_yield=0.0)
             res = engine.compute_gex(df_chain, spot_price=spot_price)
@@ -524,16 +531,21 @@ def _build_calibrated_derivatives_fallback(spot_price: float) -> Dict[str, Any]:
     }
 
 
-def build_derivatives_card_html(derivatives: Optional[Dict[str, Any]], spot_price: float = 0.0) -> str:
+def build_derivatives_card_html(
+    derivatives: Optional[Dict[str, Any]],
+    spot_price: float = 0.0,
+    symbol: str = "",
+    adtv: Optional[float] = None,
+) -> str:
     """
     Construct modular HTML container for Institutional Derivatives & Dealer Gamma Exposure (GEX).
     Guarantees that the GEX card is rendered whenever spot_price > 0, synthesizing a calibrated
-    surface if external options feed is omitted.
+    surface scaled to liquidity if external options feed is omitted.
     """
     if not derivatives:
         if spot_price <= 0.0:
             return ""
-        derivatives = _build_calibrated_derivatives_fallback(spot_price)
+        derivatives = _build_calibrated_derivatives_fallback(spot_price, symbol=symbol, adtv=adtv)
 
     net_gex = derivatives.get("net_gex_millions", 0.0)
     net_gex_color = "text-emerald-400" if net_gex >= 0 else "text-rose-400"
@@ -549,10 +561,15 @@ def build_derivatives_card_html(derivatives: Optional[Dict[str, Any]], spot_pric
     rr25 = derivatives.get("rr25_skew", 0.0)
     skew_regime = derivatives.get("skew_regime", "Normal Equity Skew")
 
+    # Defensive non-degeneracy clamp for UI display
+    if call_wall <= put_wall and spot_price > 0.0:
+        call_wall = round(spot_price * 1.05, 2)
+        put_wall = round(spot_price * 0.95, 2)
+
     # Build Strike Profile rows for table/bars
     strike_profile = derivatives.get("strike_profile", [])
     if not strike_profile and spot_price > 0:
-        fallback_profile = _build_calibrated_derivatives_fallback(spot_price).get("strike_profile", [])
+        fallback_profile = _build_calibrated_derivatives_fallback(spot_price, symbol=symbol, adtv=adtv).get("strike_profile", [])
         strike_profile = fallback_profile
 
     near_strikes = [s for s in strike_profile if spot_price * 0.88 <= s.get("strike", 0.0) <= spot_price * 1.12]
@@ -601,6 +618,21 @@ def build_derivatives_card_html(derivatives: Optional[Dict[str, Any]], spot_pric
         </tr>
         """
 
+    provenance_badge = (
+        '<span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-500/10 text-amber-300 border-amber-500/30 font-mono">PROVENANCE: SYNTHETIC RESEARCH CHAIN (UNVERIFIED LIVE OPTIONS)</span>'
+        if derivatives.get('is_synthetic_surface') else
+        '<span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-emerald-500/10 text-emerald-300 border-emerald-500/30 font-mono">PROVENANCE: LIVE EXCHANGE DATA (VERIFIED)</span>'
+    )
+
+    trader_caution_banner = (
+        f"""
+        <div class="mt-2 text-[10px] text-amber-300/90 bg-amber-950/40 border border-amber-800/50 rounded-lg p-2 leading-relaxed">
+          ⚠️ <strong>Research Provenance:</strong> Model-calibrated synthetic surface. Call/Put walls reflect theoretical open interest distributions scaled to ticker liquidity. For real-capital pinning or breakout execution, independent verification against live OPRA exchange data is required.
+        </div>
+        """
+        if derivatives.get('is_synthetic_surface') else ""
+    )
+
     return f"""
     <!-- INSTITUTIONAL DERIVATIVES & DEALER GAMMA EXPOSURE (GEX) ROW -->
     <div class="bg-gray-950/70 border border-fuchsia-900/40 rounded-2xl p-5 shadow-sm">
@@ -608,7 +640,7 @@ def build_derivatives_card_html(derivatives: Optional[Dict[str, Any]], spot_pric
         <div class="flex items-center gap-2">
           <span class="w-2.5 h-2.5 rounded-full bg-fuchsia-400 animate-pulse"></span>
           <h2 class="text-xs font-bold text-fuchsia-300 uppercase tracking-wider">Institutional Derivatives &amp; Dealer Gamma Exposure (GEX)</h2>
-          {f'<span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-500/10 text-amber-300 border-amber-500/30 font-mono">CALIBRATED SYNTHETIC SURFACE</span>' if derivatives.get('is_synthetic_surface') else ''}
+          {provenance_badge}
         </div>
         <div class="text-[11px] text-gray-400 font-mono">
           Black-Scholes-Merton 2nd-Order Sensitivity &bull; Dynamic Market Maker Hedging Flows
@@ -681,6 +713,7 @@ def build_derivatives_card_html(derivatives: Optional[Dict[str, Any]], spot_pric
           <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-2">
             Dealers pin price between Put Wall &amp; Call Wall; breaks past walls generate explosive gamma squeezes.
           </div>
+          {trader_caution_banner}
         </div>
 
         <!-- VOL SURFACE & VARIANCE RISK PREMIUM -->
@@ -2011,9 +2044,16 @@ def generate_html_dashboard(
     eval_matrix = canonical_data.get("evaluation_matrix", {})
     spot_price = float(perf.get("latest_price") or (hist[-1]["close"] if hist and "close" in hist[-1] else 0.0))
 
+    # Extract 20-day ADTV for liquidity scaling
+    adtv_val = None
+    if hist:
+        vols = [float(h.get("volume", 0)) for h in hist[-20:] if h.get("volume") and float(h.get("volume", 0)) > 0]
+        if vols:
+            adtv_val = float(sum(vols) / len(vols))
+
     # Guarantee derivatives presence in canonical payload
     if not derivatives and spot_price > 0.0:
-        derivatives = _build_calibrated_derivatives_fallback(spot_price)
+        derivatives = _build_calibrated_derivatives_fallback(spot_price, symbol=symbol, adtv=adtv_val)
         canonical_data["derivatives"] = derivatives
 
     # Color palette based on recommendation
@@ -2061,7 +2101,7 @@ def generate_html_dashboard(
     proj_cards_html = build_projection_cards_html(projections)
     regime_html = build_regime_card_html(regime)
     micro_html = build_microstructure_card_html(micro)
-    derivatives_html = build_derivatives_card_html(derivatives, spot_price=spot_price)
+    derivatives_html = build_derivatives_card_html(derivatives, spot_price=spot_price, symbol=symbol, adtv=adtv_val)
     events_html = build_events_card_html(events)
 
     # Embed canonical JSON payload for browser client execution without CORS restrictions

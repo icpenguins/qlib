@@ -1472,12 +1472,14 @@ def compute_dealer_gex_features(
         if np.isnan(realized_vol_21d) or realized_vol_21d < 0.05:
             realized_vol_21d = 0.25
 
+        adtv = float(df["volume"].tail(20).mean()) if "volume" in df.columns and not df["volume"].dropna().empty else None
         loader = OptionsDataLoader(data_dir=data_dir)
         options_df = loader.load_or_generate_chain(
             symbol=symbol,
             spot=spot,
             realized_vol_21d=realized_vol_21d,
             r=r,
+            adtv=adtv,
         )
         if options_df is None or options_df.empty:
             return None

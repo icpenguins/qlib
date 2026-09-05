@@ -211,17 +211,41 @@ class DealerGammaEngine:
         total_net_gex_m = float(df["net_gex_dollar"].sum() / 1e6)
 
         # 1. Major Gamma Walls
-        # Call Wall: Strike with maximum Call GEX
-        call_wall_row = strike_groups.loc[strike_groups["call_gex_dollar"].idxmax()]
+        # Call Wall: Resistance at or above spot (maximum Call GEX)
+        otm_calls = strike_groups[strike_groups["strike"] >= spot]
+        if not otm_calls.empty and (otm_calls["call_gex_dollar"] > 0).any():
+            call_wall_row = otm_calls.loc[otm_calls["call_gex_dollar"].idxmax()]
+        else:
+            call_wall_row = strike_groups.loc[strike_groups["call_gex_dollar"].idxmax()]
         call_wall = float(call_wall_row["strike"])
 
-        # Put Wall: Strike with maximum negative Put GEX (most negative)
-        put_wall_row = strike_groups.loc[strike_groups["put_gex_dollar"].idxmin()]
+        # Put Wall: Support at or below spot (maximum negative Put GEX)
+        otm_puts = strike_groups[strike_groups["strike"] <= spot]
+        if not otm_puts.empty and (otm_puts["put_gex_dollar"] < 0).any():
+            put_wall_row = otm_puts.loc[otm_puts["put_gex_dollar"].idxmin()]
+        else:
+            put_wall_row = strike_groups.loc[strike_groups["put_gex_dollar"].idxmin()]
         put_wall = float(put_wall_row["strike"])
 
         # Absolute Wall: Strike with greatest absolute Net GEX
         abs_wall_row = strike_groups.loc[strike_groups["net_gex_dollar"].abs().idxmax()]
         absolute_wall = float(abs_wall_row["strike"])
+
+        # Non-degeneracy invariant: enforce K_put_wall < K_call_wall
+        if call_wall <= put_wall:
+            all_strikes = np.sort(strike_groups["strike"].unique())
+            above_spot = all_strikes[all_strikes > spot]
+            below_spot = all_strikes[all_strikes < spot]
+            if len(above_spot) > 0:
+                call_sub = strike_groups[strike_groups["strike"].isin(above_spot)]
+                call_wall = float(call_sub.loc[call_sub["call_gex_dollar"].idxmax()]["strike"])
+            elif len(all_strikes) > 1:
+                call_wall = float(all_strikes[-1])
+            if len(below_spot) > 0:
+                put_sub = strike_groups[strike_groups["strike"].isin(below_spot)]
+                put_wall = float(put_sub.loc[put_sub["put_gex_dollar"].idxmin()]["strike"])
+            elif len(all_strikes) > 1:
+                put_wall = float(all_strikes[0])
 
         # 2. Gamma Flip Point (Zero-Gamma Threshold S*)
         gamma_flip = self._solve_gamma_flip(df, spot)
