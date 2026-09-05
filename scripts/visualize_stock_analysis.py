@@ -56,6 +56,7 @@ from stock_analysis_data import (
     prepare_analysis_json_payload,
     export_analysis_json,
     load_analysis_json,
+    _sanitize_for_json,
 )
 
 
@@ -601,6 +602,18 @@ def build_derivatives_card_html(derivatives: Optional[Dict[str, Any]], spot_pric
         """
 
     return f"""
+    <!-- INSTITUTIONAL DERIVATIVES & DEALER GAMMA EXPOSURE (GEX) ROW -->
+    <div class="bg-gray-950/70 border border-fuchsia-900/40 rounded-2xl p-5 shadow-sm">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-3 px-1">
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-fuchsia-400 animate-pulse"></span>
+          <h2 class="text-xs font-bold text-fuchsia-300 uppercase tracking-wider">Institutional Derivatives &amp; Dealer Gamma Exposure (GEX)</h2>
+          {f'<span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-500/10 text-amber-300 border-amber-500/30 font-mono">CALIBRATED SYNTHETIC SURFACE</span>' if derivatives.get('is_synthetic_surface') else ''}
+        </div>
+        <div class="text-[11px] text-gray-400 font-mono">
+          Black-Scholes-Merton 2nd-Order Sensitivity &bull; Dynamic Market Maker Hedging Flows
+        </div>
+      </div>
 
       <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
         <!-- DEALER NET GEX & REGIME -->
@@ -993,9 +1006,28 @@ def build_buy_timing_verdict_banner_html(
         or not gamma.get("is_actionable", True)
     )
 
-    # 3. Determine Verdict Headline & Palette
+    # 3. Determine Execution Posture & Capital Preservation Invariant
     rec = pred.get("recommendation", "HOLD / CAUTIOUS BUY")
-    if is_spike and not is_synthetic:
+    rec_upper = str(rec).upper()
+    is_capital_preservation = (
+        pred.get("is_capital_preservation", False)
+        or not pred.get("is_entry_allowed", True)
+        or "DO NOT BUY" in rec_upper
+        or "CAPITAL PRESERVATION" in rec_upper
+        or "RISK-OFF" in rec_upper
+        or "REGIME SHIFT" in rec_upper
+        or "PAUSE" in rec_upper
+        or "EVENT RISK" in rec_upper
+        or pred.get("bocd_regime_state") == 2
+    )
+
+    if is_capital_preservation:
+        verdict_badge = "🔴 DO NOT BUY / CAPITAL PRESERVATION MODE"
+        verdict_pill_class = "bg-rose-500/15 text-rose-400 border-rose-500/30"
+        verdict_color = "text-rose-400"
+        verdict_icon = "▼"
+        verdict_desc = "Unfavorable technical structure, negative gamma trap, or macroeconomic regime stress. Maintain capital preservation and inhibit all buy entries."
+    elif is_spike and not is_synthetic:
         verdict_badge = "⚡ IMMEDIATE BUY: HIGH-VELOCITY 5-DAY SPIKE DETECTED"
         verdict_pill_class = "bg-emerald-500/20 text-emerald-300 border-emerald-500/50 glow-green"
         verdict_color = "text-emerald-400"
@@ -1007,19 +1039,19 @@ def build_buy_timing_verdict_banner_html(
         verdict_color = "text-amber-400"
         verdict_icon = "⚠️"
         verdict_desc = "Theoretical 5-day gamma spike modeled on synthetic fallback. Action suppressed until real-time options chain and live borrow data verify."
-    elif "STRONG BUY" in rec or "ACCUMULATE" in rec:
+    elif "STRONG BUY" in rec_upper or "ACCUMULATE" in rec_upper:
         verdict_badge = "🟢 STRONG BUY: STRATEGIC MULTI-HORIZON ACCUMULATION"
         verdict_pill_class = "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
         verdict_color = "text-emerald-400"
         verdict_icon = "▲"
         verdict_desc = "Favorable multi-horizon risk-reward profile backed by positive drift, institutional AVWAP support, and low changepoint hazard."
-    elif "PULLBACK" in rec:
+    elif "PULLBACK" in rec_upper:
         verdict_badge = "🔵 BUY ON PULLBACK: WAIT FOR ENTRY CORRIDOR"
         verdict_pill_class = "bg-blue-500/15 text-blue-400 border-blue-500/30"
         verdict_color = "text-blue-400"
         verdict_icon = "⏳"
         verdict_desc = "Stock is currently extended above near-term value. Place limit orders inside the optimal entry corridor to capture favorable asymmetry."
-    elif "HOLD" in rec or "REGIME" in rec:
+    elif "HOLD" in rec_upper:
         verdict_badge = "🟡 HOLD / CAUTIOUS BUY: IMMINENT CATALYST & REGIME HAZARD"
         verdict_pill_class = "bg-amber-500/15 text-amber-400 border-amber-500/30"
         verdict_color = "text-amber-400"
@@ -1051,7 +1083,15 @@ def build_buy_timing_verdict_banner_html(
     rr_ratio = pred.get("risk_reward_ratio", 3.0)
 
     spike_callout_badge = ""
-    if is_spike:
+    if is_spike and is_capital_preservation:
+        spike_callout_badge = f"""
+        <div class="flex items-center gap-2 bg-rose-950/80 border border-rose-500/60 rounded-xl px-4 py-2 text-xs text-rose-200">
+          <span class="w-2.5 h-2.5 rounded-full bg-rose-400"></span>
+          <span class="font-bold uppercase tracking-wider">Spike Suppressed:</span>
+          <span class="text-rose-300">Capital Preservation Active &bull; No Orders Authorized</span>
+        </div>
+        """
+    elif is_spike and not is_synthetic:
         spike_callout_badge = f"""
         <div class="flex items-center gap-2 bg-emerald-950/80 border border-emerald-500/60 rounded-xl px-4 py-2 text-xs text-emerald-200 glow-green">
           <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
@@ -1061,15 +1101,94 @@ def build_buy_timing_verdict_banner_html(
           <span class="text-emerald-400">| P(Squeeze): <strong class="text-white">{prob_spike:.1f}%</strong></span>
         </div>
         """
+    elif is_spike and is_synthetic:
+        spike_callout_badge = f"""
+        <div class="flex items-center gap-2 bg-amber-950/80 border border-amber-500/60 rounded-xl px-4 py-2 text-xs text-amber-200">
+          <span class="w-2.5 h-2.5 rounded-full bg-amber-400"></span>
+          <span class="font-bold uppercase tracking-wider">Simulated Spike (Research):</span>
+          <span class="font-mono text-white font-bold text-sm">+{exp_jump:.1f}%</span>
+          <span class="text-amber-300">| Unvalidated Fallback</span>
+        </div>
+        """
 
     safety_pill = ""
-    if is_synthetic:
+    if is_capital_preservation:
+        safety_pill = """
+        <span class="text-[10px] font-bold px-2.5 py-1 rounded-full border bg-rose-950/60 text-rose-300 border-rose-600/60 flex items-center gap-1">
+          <span class="w-1.5 h-1.5 rounded-full bg-rose-400"></span>
+          ENTRIES INHIBITED (RISK-OFF)
+        </span>
+        """
+    elif is_synthetic:
         safety_pill = """
         <span class="text-[10px] font-bold px-2.5 py-1 rounded-full border bg-amber-950/60 text-amber-300 border-amber-600/60 flex items-center gap-1">
           <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
           SAFETY INVARIANT: SYNTHETIC RESEARCH DATA
         </span>
         """
+
+    # Protocol Boxes Content
+    if is_capital_preservation:
+        b1_answer = '<div class="text-xl font-black text-rose-400 mt-1">NO &mdash; STAND ASIDE</div>'
+        b1_conviction = 'Conviction: <strong class="text-rose-300">Capital Preservation (Risk-Off)</strong>'
+
+        b2_window = '<div class="text-sm font-black text-rose-400 mt-1">ENTRIES INHIBITED</div>'
+        b2_clock = '<div class="text-[11px] text-rose-400/80 mt-1 font-mono">No Active Buy Window &bull; Stand Aside</div>'
+
+        b3_corridor = '<div class="text-lg font-black text-rose-400 font-mono mt-1">ENTRIES INHIBITED</div>'
+        b3_sub = f'Spot Price: <span class="font-mono text-gray-200">${spot_price:.2f}</span> &bull; <span class="text-rose-400 font-semibold">Capital Preservation Active</span>'
+
+        b4_title = "Capital Protection Floor"
+        b4_val = f'<div class="text-lg font-black text-rose-400 font-mono mt-1">${stop_loss:.2f}</div>'
+        b4_sub = f'Structural Floor: <span class="font-mono text-gray-300">${pred.get("key_support", stop_loss):.2f}</span>'
+
+        b5_target = '<div class="text-lg font-black text-gray-400 font-mono mt-1">N/A &mdash; STAND ASIDE</div>'
+        b5_sub = 'Risk-Off Regime &bull; Upside Suppressed'
+    elif is_synthetic:
+        b1_answer = '<div class="text-xl font-black text-amber-400 mt-1">RESEARCH ONLY</div>'
+        b1_conviction = 'Conviction: <strong class="text-amber-300">Simulated (Unvalidated)</strong>'
+
+        b2_window = '<div class="text-sm font-bold text-amber-300 mt-1">SIMULATION ONLY</div>'
+        b2_clock = '<div class="text-[11px] text-amber-400/80 mt-1 font-mono">Paper Trade Only &bull; Live Orders Suppressed</div>'
+
+        b3_corridor = f'<div class="text-lg font-bold text-amber-300 font-mono mt-1">${entry_low:.2f} &ndash; ${entry_high:.2f} (THEORETICAL)</div>'
+        b3_sub = f'Spot Price: <span class="font-mono text-gray-200">${spot_price:.2f}</span>'
+
+        b4_title = "Invalidation Stop-Loss"
+        b4_val = f'<div class="text-lg font-black text-rose-400 font-mono mt-1">${stop_loss:.2f}</div>'
+        b4_sub = f'Structural Floor: <span class="font-mono text-gray-300">${pred.get("key_support", stop_loss):.2f}</span>'
+
+        b5_target = f'<div class="text-lg font-black text-amber-400 font-mono mt-1">${target_price:.2f} <span class="text-xs font-semibold text-gray-400">({rr_ratio}:1 Sim)</span></div>'
+        b5_sub = f'Simulated Asymmetry: <strong class="text-amber-200">+{((target_price/spot_price)-1)*100 if spot_price > 0 else 0:.1f}%</strong>'
+    else:
+        if "BUY" in rec_upper and "PULLBACK" not in rec_upper:
+            ans_str = "YES - BUY NOW"
+            c_str = "High (Spike Setup)" if is_spike else ("Medium-High" if "STRONG" in rec_upper else "Positive Drift")
+            c_col = "text-emerald-400"
+        elif "PULLBACK" in rec_upper:
+            ans_str = "BUY ON DIP"
+            c_str = "Pullback Corridor"
+            c_col = "text-blue-400"
+        else:
+            ans_str = "STAND ASIDE"
+            c_str = "Defensive"
+            c_col = "text-gray-400"
+
+        b1_answer = f'<div class="text-xl font-black {c_col} mt-1">{ans_str}</div>'
+        b1_conviction = f'Conviction: <strong class="text-white">{c_str}</strong>'
+
+        b2_window = f'<div class="text-sm font-black text-white mt-1">{time_window_str}</div>'
+        b2_clock = f'<div class="text-[11px] text-emerald-400 mt-1 font-mono">{clock.get("t1_open_action", "Immediate Market Open limit entry")}</div>'
+
+        b3_corridor = f'<div class="text-lg font-black text-white font-mono mt-1">${entry_low:.2f} &ndash; ${entry_high:.2f}</div>'
+        b3_sub = f'Spot Price: <span class="font-mono text-gray-200">${spot_price:.2f}</span>'
+
+        b4_title = "Invalidation Stop-Loss"
+        b4_val = f'<div class="text-lg font-black text-rose-400 font-mono mt-1">${stop_loss:.2f}</div>'
+        b4_sub = f'Structural Floor: <span class="font-mono text-gray-300">${pred.get("key_support", stop_loss):.2f}</span>'
+
+        b5_target = f'<div class="text-lg font-black text-emerald-400 font-mono mt-1">${target_price:.2f} <span class="text-xs font-semibold text-blue-400">({rr_ratio}:1)</span></div>'
+        b5_sub = f'Expected Asymmetry: <strong class="text-white">+{((target_price/spot_price)-1)*100 if spot_price > 0 else 0:.1f}%</strong>'
 
     return f"""
     <!-- EXECUTIVE BUY TIMING VERDICT BANNER -->
@@ -1098,55 +1217,43 @@ def build_buy_timing_verdict_banner_html(
         <!-- 1. RECOMMENDATION VERDICT -->
         <div class="bg-gray-900/80 border border-gray-800 rounded-xl p-3.5 flex flex-col justify-between">
           <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Should It Be Bought?</div>
-          <div class="text-xl font-black {verdict_color} mt-1">
-            {'YES - BUY NOW' if ('BUY' in rec and not is_synthetic and 'PULLBACK' not in rec) else ('BUY ON DIP' if 'PULLBACK' in rec else ('RESEARCH ONLY' if is_synthetic else 'STAND ASIDE'))}
-          </div>
+          {b1_answer}
           <div class="text-[11px] text-gray-400 mt-1 font-medium">
-            Conviction: <strong class="text-white">{'High (Spike Setup)' if is_spike else ('Medium-High' if 'STRONG' in rec else 'Defensive')}</strong>
+            {b1_conviction}
           </div>
         </div>
 
         <!-- 2. WHEN TO BUY (EXECUTION WINDOW) -->
         <div class="bg-gray-900/80 border border-gray-800 rounded-xl p-3.5 flex flex-col justify-between">
           <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">When Should It Be Bought?</div>
-          <div class="text-sm font-black text-white mt-1">
-            {time_window_str}
-          </div>
-          <div class="text-[11px] text-emerald-400 mt-1 font-mono">
-            {clock.get('t1_open_action', 'Immediate Market Open limit entry')}
-          </div>
+          {b2_window}
+          {b2_clock}
         </div>
 
         <!-- 3. OPTIMAL ENTRY CORRIDOR -->
         <div class="bg-gray-900/80 border border-gray-800 rounded-xl p-3.5 flex flex-col justify-between">
           <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Optimal Entry Corridor</div>
-          <div class="text-lg font-black text-white font-mono mt-1">
-            ${entry_low:.2f} &ndash; ${entry_high:.2f}
-          </div>
+          {b3_corridor}
           <div class="text-[11px] text-gray-400 mt-1">
-            Spot Price: <span class="font-mono text-gray-200">${spot_price:.2f}</span>
+            {b3_sub}
           </div>
         </div>
 
         <!-- 4. INVALIDATION STOP-LOSS -->
         <div class="bg-gray-900/80 border border-gray-800 rounded-xl p-3.5 flex flex-col justify-between">
-          <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Invalidation Stop-Loss</div>
-          <div class="text-lg font-black text-rose-400 font-mono mt-1">
-            ${stop_loss:.2f}
-          </div>
+          <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">{b4_title}</div>
+          {b4_val}
           <div class="text-[11px] text-gray-400 mt-1">
-            Structural Floor: <span class="font-mono text-gray-300">${pred.get('key_support', stop_loss):.2f}</span>
+            {b4_sub}
           </div>
         </div>
 
         <!-- 5. PROFIT TARGET & ASYMMETRY -->
         <div class="bg-gray-900/80 border border-gray-800 rounded-xl p-3.5 flex flex-col justify-between">
           <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Upper Target / R:R</div>
-          <div class="text-lg font-black text-emerald-400 font-mono mt-1">
-            ${target_price:.2f} <span class="text-xs font-semibold text-blue-400">({rr_ratio}:1)</span>
-          </div>
+          {b5_target}
           <div class="text-[11px] text-gray-400 mt-1">
-            Expected Asymmetry: <strong class="text-white">+{((target_price/spot_price)-1)*100 if spot_price > 0 else 0:.1f}%</strong>
+            {b5_sub}
           </div>
         </div>
       </div>
@@ -1157,10 +1264,15 @@ def build_buy_timing_verdict_banner_html(
 def build_gamma_squeeze_spike_card_html(
     gamma_squeeze: Optional[Dict[str, Any]],
     spot_price: float = 0.0,
+    recommendation: Optional[str] = None,
+    pred: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Construct modular HTML container for Next-Day to Next-Week (t+1 to t+5) Squeeze & 5-Day Upward Spike Radar.
     Provides prominent visual alert when a 5-trading-day upward spike potential is detected.
+    Enforces the Ironclad Execution Safety Invariant:
+    If a stock's verdict is DO NOT BUY / CAPITAL PRESERVATION / REGIME SHIFT ALERT / EVENT RISK,
+    or if entries are inhibited, all buy entry instructions and active execution clocks are suppressed.
     """
     if not gamma_squeeze:
         return ""
@@ -1185,8 +1297,25 @@ def build_gamma_squeeze_spike_card_html(
         or not gamma_squeeze.get("is_actionable", True)
     )
 
+    rec_str = (recommendation or (pred.get("recommendation", "") if pred else "") or "").upper()
+    is_cap_pres = (
+        (pred and pred.get("is_capital_preservation", False))
+        or (pred and not pred.get("is_entry_allowed", True))
+        or "DO NOT BUY" in rec_str
+        or "CAPITAL PRESERVATION" in rec_str
+        or "RISK-OFF" in rec_str
+        or "REGIME SHIFT" in rec_str
+        or "PAUSE" in rec_str
+        or "EVENT RISK" in rec_str
+    )
+
     # Styling for Spike Radar
-    if is_spike and not is_synthetic:
+    if is_cap_pres:
+        container_border = "border-rose-900/40 bg-gray-950/70"
+        status_badge = "bg-rose-500/10 text-rose-400 border-rose-500/30"
+        status_text = "INACTIVE / STAND ASIDE (CAPITAL PRESERVATION)"
+        pulse_color = "bg-rose-400"
+    elif is_spike and not is_synthetic:
         container_border = "border-emerald-500/60 bg-emerald-950/20 glow-green"
         status_badge = "bg-emerald-500/20 text-emerald-300 border-emerald-500/50"
         status_text = "ACTIVE 5-DAY UPWARD SPIKE DETECTED"
@@ -1222,9 +1351,31 @@ def build_gamma_squeeze_spike_card_html(
     res_gsi = factor_ortho.get("residual_gsi", 0.0)
 
     t0_time = clock.get("t0_timestamp", "Post-Close AMC")
-    t1_action = clock.get("t1_open_action", "Execute limit buy at 09:30 AM open")
-    t5_action = clock.get("t5_exit_action", "Take profit / de-gross at Upper Squeeze Wall")
-    exec_window = clock.get("execution_window", "5-Trading-Day Window (t+1 to t+5)")
+
+    if is_cap_pres:
+        exec_window = "SUSPENDED &mdash; CAPITAL PRESERVATION"
+        t1_action = "ENTRIES INHIBITED &mdash; STAND ASIDE (Risk-Off Regime)"
+        t1_action_class = "text-rose-400 font-bold text-[11px]"
+        t5_action = "No Active Position Authorized"
+        clock_badge = "bg-rose-500/10 text-rose-300 border-rose-500/30"
+        clock_badge_text = "STAND ASIDE"
+        footer_desc = "Execution protocol suspended. Capital preservation active; no buy orders authorized."
+    elif is_synthetic:
+        exec_window = clock.get("execution_window", "5-Trading-Day Window (Simulated)")
+        t1_action = "PAPER TRADE / SIMULATION ONLY (Live Orders Suppressed)"
+        t1_action_class = "text-amber-400 font-medium text-[11px]"
+        t5_action = "Paper Trade Exit Model (Theoretical)"
+        clock_badge = "bg-amber-500/10 text-amber-300 border-amber-500/30"
+        clock_badge_text = "SIMULATION"
+        footer_desc = "Strict institutional execution protocol in simulation mode; live orders suppressed on synthetic data."
+    else:
+        exec_window = clock.get("execution_window", "5-Trading-Day Window (t+1 to t+5)")
+        t1_action = clock.get("t1_open_action", "Execute limit buy at 09:30 AM open")
+        t1_action_class = "text-emerald-400 font-medium text-[11px]"
+        t5_action = clock.get("t5_exit_action", "Take profit / de-gross at Upper Squeeze Wall")
+        clock_badge = "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
+        clock_badge_text = "T+1 &rarr; T+5"
+        footer_desc = "Strict institutional execution protocol enforces zero lookahead leakage and disciplined take-profit into the Upper Squeeze Wall."
 
     return f"""
     <!-- 5-TRADING-DAY UPWARD SPIKE RADAR & EARNINGS GAMMA SQUEEZE CARD -->
@@ -1366,7 +1517,7 @@ def build_gamma_squeeze_spike_card_html(
           <div>
             <div class="flex justify-between items-center mb-1">
               <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">5-Day Execution Clock</span>
-              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-emerald-500/10 text-emerald-300 border-emerald-500/30 font-mono">T+1 &rarr; T+5</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {clock_badge} font-mono">{clock_badge_text}</span>
             </div>
             <div class="text-sm font-black text-white mt-1">
               {exec_window}
@@ -1378,7 +1529,7 @@ def build_gamma_squeeze_spike_card_html(
               </div>
               <div>
                 <span class="text-gray-500 block text-[10px]">T1 ENTRY (09:30 OPEN):</span>
-                <span class="text-emerald-400 font-medium text-[11px]">{t1_action}</span>
+                <span class="{t1_action_class}">{t1_action}</span>
               </div>
               <div>
                 <span class="text-gray-500 block text-[10px]">T5 EXIT (SPIKE PEAK):</span>
@@ -1387,7 +1538,7 @@ def build_gamma_squeeze_spike_card_html(
             </div>
           </div>
           <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
-            Strict institutional execution protocol enforces zero lookahead leakage and disciplined take-profit into the Upper Squeeze Wall.
+            {footer_desc}
           </div>
         </div>
       </div>
@@ -1821,6 +1972,20 @@ def generate_html_dashboard(
     }
     rec_color, rec_badge_class = rec_colors.get(pred.get("recommendation", ""), ("#3b82f6", "bg-blue-500/10 text-blue-400 border-blue-500/30"))
 
+    # Determine execution posture
+    rec_str = str(pred.get("recommendation", "")).upper()
+    is_capital_preservation = (
+        pred.get("is_capital_preservation", False)
+        or not pred.get("is_entry_allowed", True)
+        or "DO NOT BUY" in rec_str
+        or "CAPITAL PRESERVATION" in rec_str
+        or "RISK-OFF" in rec_str
+        or "REGIME SHIFT" in rec_str
+        or "PAUSE" in rec_str
+        or "EVENT RISK" in rec_str
+        or pred.get("bocd_regime_state") == 2
+    )
+
     # Build modular HTML cards
     buy_verdict_banner_html = build_buy_timing_verdict_banner_html(
         pred=pred,
@@ -1831,6 +1996,8 @@ def generate_html_dashboard(
     gamma_squeeze_spike_html = build_gamma_squeeze_spike_card_html(
         gamma_squeeze=gamma_squeeze,
         spot_price=spot_price,
+        recommendation=pred.get("recommendation", ""),
+        pred=pred,
     )
     eval_matrix_html = build_multi_horizon_matrix_card_html(eval_matrix)
     backtest_html = build_backtesting_protocol_card_html(backtest)
@@ -2000,12 +2167,12 @@ def generate_html_dashboard(
           <span class="text-xs font-bold text-blue-400 uppercase tracking-wider">3-Month Strategy</span>
           <span class="text-xs font-bold px-2 py-0.5 rounded bg-blue-500/20 text-blue-300">R:R {pred['risk_reward_ratio']}:1</span>
         </div>
-        <div class="text-xl font-black text-white mb-1">
-          ${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}
+        <div class="text-xl font-black {'text-rose-400' if is_capital_preservation else 'text-white'} mb-1">
+          {f"ENTRIES INHIBITED" if is_capital_preservation else f"${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}"}
         </div>
-        <div class="text-xs text-gray-400 mb-3">Recommended Optimal Entry Range</div>
+        <div class="text-xs text-gray-400 mb-3">{f"Recommended Optimal Entry Range (Suspended)" if is_capital_preservation else "Recommended Optimal Entry Range"}</div>
         <div class="text-xs border-t border-gray-800/80 pt-2 space-y-1">
-          <div class="flex justify-between"><span class="text-gray-500">Optimal Window:</span> <span class="text-emerald-300 font-medium">{pred['optimal_buy_window']['start_date']} &rarr; {pred['optimal_buy_window']['end_date']}</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Optimal Window:</span> <span class="{'text-rose-400 font-bold' if is_capital_preservation else 'text-emerald-300 font-medium'}">{f"SUSPENDED (Risk-Off Regime)" if is_capital_preservation else f"{pred['optimal_buy_window']['start_date']} &rarr; {pred['optimal_buy_window']['end_date']}"}</span></div>
           <div class="flex justify-between"><span class="text-gray-500">Stop-Loss:</span> <span class="text-red-400 font-medium">${pred['stop_loss']:.2f}</span></div>
           <div class="flex justify-between"><span class="text-gray-500">Key Support:</span> <span class="text-gray-300 font-medium">${pred['key_support']:.2f}</span></div>
           {f'''<div class="flex justify-between"><span class="text-gray-500">BOCD Regime:</span> <span class="text-amber-300 font-medium">{pred.get("bocd_regime_name")}</span></div>''' if pred.get("bocd_regime_name") else ''}
@@ -2157,11 +2324,11 @@ def generate_html_dashboard(
           {f'''<div class="bg-purple-950/40 border border-purple-800/40 px-3 py-1.5 rounded-lg text-purple-300">
             <span class="text-gray-400">63d Changepoint Risk:</span> <strong>{pred.get("bocd_forward_changepoint_prob_pct"):.1f}%</strong>
           </div>''' if pred.get("bocd_forward_changepoint_prob_pct") is not None else ''}
-          <div class="bg-emerald-950/40 border border-emerald-800/40 px-3 py-1.5 rounded-lg text-emerald-300">
-            <span class="text-gray-400">Optimal Window:</span> <strong>{pred['optimal_buy_window']['start_date']} &rarr; {pred['optimal_buy_window']['end_date']}</strong>
+          <div class="{'bg-rose-950/40 border border-rose-800/40 px-3 py-1.5 rounded-lg text-rose-300' if is_capital_preservation else 'bg-emerald-950/40 border border-emerald-800/40 px-3 py-1.5 rounded-lg text-emerald-300'}">
+            <span class="text-gray-400">Optimal Window:</span> <strong>{'SUSPENDED' if is_capital_preservation else f"{pred['optimal_buy_window']['start_date']} &rarr; {pred['optimal_buy_window']['end_date']}"}</strong>
           </div>
-          <div class="bg-blue-950/40 border border-blue-800/40 px-3 py-1.5 rounded-lg text-blue-300">
-            <span class="text-gray-400">Target Range:</span> <strong>${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}</strong>
+          <div class="{'bg-rose-950/40 border border-rose-800/40 px-3 py-1.5 rounded-lg text-rose-300' if is_capital_preservation else 'bg-blue-950/40 border border-blue-800/40 px-3 py-1.5 rounded-lg text-blue-300'}">
+            <span class="text-gray-400">Target Range:</span> <strong>{'ENTRIES INHIBITED' if is_capital_preservation else f"${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}"}</strong>
           </div>
         </div>
       </div>
@@ -3326,9 +3493,10 @@ def generate_html_dashboard(
         ctx.fill();
 
         // Shaded Optimal Buy Zone Box
+        const isEntryAllowed = PREDICTIVE.is_entry_allowed !== false && !PREDICTIVE.is_capital_preservation;
         const optStartIdx = forecastSeries.findIndex(f => f.date === PREDICTIVE.optimal_buy_window.start_date);
         const optEndIdx = forecastSeries.findIndex(f => f.date === PREDICTIVE.optimal_buy_window.end_date);
-        if (optStartIdx >= 0 && optEndIdx >= 0) {{
+        if (isEntryAllowed && optStartIdx >= 0 && optEndIdx >= 0) {{
           const bx1 = getX(histLen + optStartIdx);
           const bx2 = getX(histLen + optEndIdx);
           const by1 = getY(PREDICTIVE.optimal_entry_range[1]);
@@ -3824,8 +3992,29 @@ def main():
     if pred.get("pead_regime"):
         print(f"PEAD Momentum:      {pred['pead_regime']}")
     print(f"Action:             {pred['action_summary']}")
-    print(f"Optimal Entry Zone: ${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}")
-    print(f"Optimal Window:     {pred['optimal_buy_window']['description']}")
+    rec_cli = str(pred.get("recommendation", "")).upper()
+    is_cap_pres_cli = (
+        pred.get("is_capital_preservation", False)
+        or not pred.get("is_entry_allowed", True)
+        or "DO NOT BUY" in rec_cli
+        or "CAPITAL PRESERVATION" in rec_cli
+        or "RISK-OFF" in rec_cli
+        or "REGIME SHIFT" in rec_cli
+        or "PAUSE" in rec_cli
+        or "EVENT RISK" in rec_cli
+    )
+    opt_entry_str = (
+        "ENTRIES INHIBITED (Capital Preservation Mode)"
+        if is_cap_pres_cli
+        else f"${pred['optimal_entry_range'][0]:.2f} - ${pred['optimal_entry_range'][1]:.2f}"
+    )
+    opt_win_str = (
+        "SUSPENDED (Risk-Off Regime)"
+        if is_cap_pres_cli
+        else pred['optimal_buy_window']['description']
+    )
+    print(f"Optimal Entry Zone: {opt_entry_str}")
+    print(f"Optimal Window:     {opt_win_str}")
     print(f"3-Month Target:     ${pred['target_price_3m']:.2f} ({'+' if pred['expected_return_pct'] >= 0 else ''}{pred['expected_return_pct']:.1f}%)")
     print(f"Stop-Loss Level:    ${pred['stop_loss']:.2f}")
     print(f"Risk/Reward Ratio:  {pred['risk_reward_ratio']}:1")

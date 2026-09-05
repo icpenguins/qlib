@@ -1053,6 +1053,19 @@ def predict_future_buy_timing(
             "bull_p90": round(float(p90_bull[i]), 2),
         })
 
+    is_capital_preservation = (
+        recommendation in [
+            "RISK-OFF / CAPITAL PRESERVATION",
+            "REGIME SHIFT ALERT / PAUSE ENTRIES",
+            "EVENT RISK / PRE-EARNINGS DE-GROSSING",
+        ]
+        or "DO NOT BUY" in recommendation
+        or "PRESERVATION" in recommendation
+        or regime_state == 2
+    )
+    is_entry_allowed = not is_capital_preservation
+    execution_posture = "ACTIONABLE_BUY" if is_entry_allowed else "ENTRIES_INHIBITED"
+
     return {
         "current_price": current_price,
         "current_date": latest_date_str,
@@ -1063,11 +1076,22 @@ def predict_future_buy_timing(
         "key_resistance": round(resistance, 2),
         "recommendation": recommendation,
         "action_summary": action_summary,
+        "is_entry_allowed": is_entry_allowed,
+        "is_capital_preservation": is_capital_preservation,
+        "execution_posture": execution_posture,
+        "entry_corridor_display": f"${entry_low:.2f} - ${entry_high:.2f}" if is_entry_allowed else "ENTRIES INHIBITED",
         "optimal_entry_range": [round(entry_low, 2), round(entry_high, 2)],
         "optimal_buy_window": {
             "start_date": opt_window_start,
             "end_date": opt_window_end,
-            "description": f"Between {opt_window_start} and {opt_window_end}",
+            "is_active": is_entry_allowed,
+            "status": "ACTIVE" if is_entry_allowed else "SUSPENDED",
+            "description": (
+                f"Between {opt_window_start} and {opt_window_end}"
+                if is_entry_allowed else
+                f"Entries suspended due to {recommendation} regime"
+            ),
+            "modeled_window_dates": [opt_window_start, opt_window_end],
         },
         "target_price_3m": target_price_3m,
         "expected_return_pct": expected_gain_pct,

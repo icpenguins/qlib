@@ -674,6 +674,65 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
             self.assertTrue(expected_json.exists())
             self.assertFalse(expected_html.exists())
 
+    def test_capital_preservation_execution_safety_invariants(self):
+        """
+        Verify that in Capital Preservation / Risk-Off regimes, all buy execution instructions,
+        active buy windows, and entry corridors are strictly inhibited.
+        Guarantees that a trader cannot receive a 'DO NOT BUY' verdict alongside limit-buy instructions.
+        """
+        # 1. Test Executive Verdict Banner suppression
+        risk_off_pred = dict(self.mock_analysis["predictive"])
+        risk_off_pred["recommendation"] = "RISK-OFF / CAPITAL PRESERVATION"
+        risk_off_pred["is_capital_preservation"] = True
+        risk_off_pred["is_entry_allowed"] = False
+        risk_off_pred["execution_posture"] = "ENTRIES_INHIBITED"
+
+        banner_html = build_buy_timing_verdict_banner_html(
+            pred=risk_off_pred,
+            gamma_squeeze=self.mock_analysis["earnings_gamma_squeeze"],
+            eval_matrix=self.mock_analysis["evaluation_matrix"],
+            spot_price=140.0,
+        )
+        self.assertIn("DO NOT BUY / CAPITAL PRESERVATION MODE", banner_html)
+        self.assertIn("NO &mdash; STAND ASIDE", banner_html)
+        self.assertIn("ENTRIES INHIBITED", banner_html)
+        self.assertIn("No Active Buy Window &bull; Stand Aside", banner_html)
+        self.assertIn("Capital Protection Floor", banner_html)
+        self.assertIn("N/A &mdash; STAND ASIDE", banner_html)
+        self.assertNotIn("Execute limit buy", banner_html)
+        self.assertNotIn("Immediate Market Open limit entry", banner_html)
+
+        # 2. Test 5-Day Execution Clock suppression in Gamma Squeeze Card
+        spike_html = build_gamma_squeeze_spike_card_html(
+            self.mock_analysis["earnings_gamma_squeeze"],
+            spot_price=140.0,
+            recommendation="RISK-OFF / CAPITAL PRESERVATION",
+            pred=risk_off_pred,
+        )
+        self.assertIn("INACTIVE / STAND ASIDE (CAPITAL PRESERVATION)", spike_html)
+        self.assertIn("STAND ASIDE", spike_html)
+        self.assertIn("ENTRIES INHIBITED &mdash; STAND ASIDE (Risk-Off Regime)", spike_html)
+        self.assertIn("SUSPENDED &mdash; CAPITAL PRESERVATION", spike_html)
+        self.assertIn("No Active Position Authorized", spike_html)
+        self.assertNotIn("Execute limit buy", spike_html)
+
+        # 3. Test Full Dashboard HTML rendering under Capital Preservation
+        with tempfile.TemporaryDirectory() as tmpdir:
+            risk_off_analysis = dict(self.mock_analysis)
+            risk_off_analysis["predictive"] = risk_off_pred
+            out_html_path = Path(tmpdir) / "RISK_OFF_report.html"
+            generate_html_dashboard(risk_off_analysis, out_html_path)
+            self.assertTrue(out_html_path.exists())
+            html_text = out_html_path.read_text(encoding="utf-8")
+
+            # Must contain capital preservation badges and suppressed corridors
+            self.assertIn("ENTRIES INHIBITED", html_text)
+            self.assertIn("SUSPENDED (Risk-Off Regime)", html_text)
+            self.assertIn("NO &mdash; STAND ASIDE", html_text)
+            # Must NOT contain actionable limit buy instructions anywhere
+            self.assertNotIn("Execute limit buy at 09:30 AM open", html_text)
+            self.assertNotIn("Immediate Market Open limit entry", html_text)
+
 
 if __name__ == "__main__":
     unittest.main()
