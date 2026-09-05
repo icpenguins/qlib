@@ -44,22 +44,35 @@ if str(CURRENT_DIR) not in sys.path:
 if str(CONTRIB_DIR) not in sys.path:
     sys.path.insert(0, str(CONTRIB_DIR))
 
-from stock_analysis_engine import run_stock_analysis, compute_multi_period_projections
+from stock_analysis_engine import (
+    run_stock_analysis,
+    compute_multi_period_projections,
+    compute_dealer_gex_features,
+)
 
 try:
     from qlib.contrib.derivatives import (
         evaluate_earnings_gamma_squeeze,
         DataProvenance,
+        DealerGammaEngine,
+        SyntheticOptionSurfaceGenerator,
+        VolatilitySurfaceFeatures,
     )
 except Exception:
     try:
         from derivatives import (
             evaluate_earnings_gamma_squeeze,
             DataProvenance,
+            DealerGammaEngine,
+            SyntheticOptionSurfaceGenerator,
+            VolatilitySurfaceFeatures,
         )
     except Exception:
         evaluate_earnings_gamma_squeeze = None
         DataProvenance = None
+        DealerGammaEngine = None
+        SyntheticOptionSurfaceGenerator = None
+        VolatilitySurfaceFeatures = None
 
 
 def resolve_json_path(
@@ -206,13 +219,45 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
     else:
         history_payload = []
 
+    derivatives = analysis_data.get("derivatives")
+    if not derivatives:
+        spot_val = 0.0
+        if isinstance(raw_hist, pd.DataFrame) and not raw_hist.empty and "close" in raw_hist.columns:
+            spot_val = float(raw_hist["close"].iloc[-1])
+        elif perf and "latest_price" in perf:
+            spot_val = float(perf["latest_price"])
+        elif perf and "latest_close" in perf:
+            spot_val = float(perf["latest_close"])
+
+        if spot_val > 0.0:
+            if compute_dealer_gex_features is not None and isinstance(raw_hist, pd.DataFrame) and not raw_hist.empty:
+                try:
+                    derivatives = compute_dealer_gex_features(raw_hist, symbol=symbol)
+                except Exception as e:
+                    logger.debug(f"compute_dealer_gex_features fallback: {e}")
+            if not derivatives and DealerGammaEngine is not None and SyntheticOptionSurfaceGenerator is not None:
+                try:
+                    chain = SyntheticOptionSurfaceGenerator.generate_synthetic_chain(spot_price=spot_val)
+                    engine = DealerGammaEngine()
+                    derivatives = engine.compute_gex(chain, spot_price=spot_val)
+                    if VolatilitySurfaceFeatures is not None:
+                        vol = VolatilitySurfaceFeatures.compute_surface_metrics(chain, spot=spot_val, realized_vol_21d=0.25, r=0.045)
+                        derivatives["vol_surface"] = vol
+                        derivatives["atm_iv_pct"] = vol.get("atm_iv_pct", 25.0)
+                        derivatives["vrp_pct"] = vol.get("vrp_pct", 0.0)
+                        derivatives["rr25_skew"] = vol.get("rr25_skew", -2.0)
+                        derivatives["skew_regime"] = vol.get("skew_regime", "Normal Equity Skew")
+                    derivatives["is_synthetic_surface"] = True
+                except Exception as e:
+                    logger.debug(f"SyntheticOptionSurfaceGenerator fallback: {e}")
+
     projections = analysis_data.get("projections")
     if not projections and isinstance(raw_hist, pd.DataFrame):
         projections = compute_multi_period_projections(
             raw_hist,
             regime=analysis_data.get("regime"),
             microstructure=analysis_data.get("microstructure"),
-            derivatives=analysis_data.get("derivatives"),
+            derivatives=derivatives or analysis_data.get("derivatives"),
         )
 
     earnings_gamma_squeeze = analysis_data.get("earnings_gamma_squeeze")
@@ -287,7 +332,7 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
         "projections": projections or {},
         "regime": analysis_data.get("regime", {}),
         "microstructure": analysis_data.get("microstructure", {}),
-        "derivatives": analysis_data.get("derivatives", {}),
+        "derivatives": derivatives or analysis_data.get("derivatives", {}),
         "events": analysis_data.get("events", {}),
         "earnings_gamma_squeeze": earnings_gamma_squeeze or {},
         "backtesting_protocol": backtesting_protocol or {},

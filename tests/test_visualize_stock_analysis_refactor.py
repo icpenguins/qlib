@@ -8,7 +8,6 @@ import sys
 import json
 import tempfile
 import unittest
-import datetime
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -31,6 +30,10 @@ from visualize_stock_analysis import (
     build_microstructure_card_html,
     build_derivatives_card_html,
     build_events_card_html,
+    build_buy_timing_verdict_banner_html,
+    build_gamma_squeeze_spike_card_html,
+    build_multi_horizon_matrix_card_html,
+    build_backtesting_protocol_card_html,
 )
 
 
@@ -223,7 +226,168 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
                         "drift_30d_pct": 4.2,
                     }
                 ],
-            }
+            },
+            "earnings_gamma_squeeze": {
+                "calibrate_post_earnings_volatility_surface": {
+                    "expected_jump_pct": 8.5,
+                    "event_variance": 0.0072,
+                    "post_earnings_iv": 0.35,
+                    "historical_crush_ratio": 0.42,
+                    "crush_source": "winsorized_median",
+                    "min_samples_threshold": 4,
+                },
+                "forced_dealer_hedging": {
+                    "dealer_shares_to_buy": 1250000,
+                    "dealer_dollar_demand": 175000000.0,
+                    "dealer_hedging_velocity": "High Convexity",
+                    "pct_adtv_demand": 28.5,
+                },
+                "liquidity_impact": {
+                    "expected_spread_widening_bps": 18.2,
+                    "expected_slippage_bps": 24.5,
+                    "turnover_ratio": 0.045,
+                    "liquidity_regime": "Expanding Spread / Thin Book",
+                },
+                "gsi_scores": {
+                    "gsi_raw": 78.5,
+                    "gsi_positive": 82.4,
+                    "gsi_negative": 12.0,
+                    "is_positive_squeeze_candidate": True,
+                    "is_negative_squeeze_candidate": False,
+                },
+                "factor_orthogonalization": {
+                    "residual_gsi": 76.2,
+                    "fama_french_exposure": 0.15,
+                    "beta_adj_factor": 1.05,
+                },
+                "calibrated_probabilities": {
+                    "calibrated_prob_squeeze": 84.5,
+                    "probability_positive_spike": 84.5,
+                    "confidence_band": [78.2, 89.6],
+                },
+                "earnings_event_clock": {
+                    "t0_timestamp": "2025-10-31 16:05:00 AMC",
+                    "t1_timestamp": "2025-11-03 09:30:00 OPEN",
+                    "t1_open_action": "Execute limit buy in optimal corridor",
+                    "t5_exit_action": "De-gross into Upper Squeeze Wall",
+                    "execution_window": "Immediate T+1 Open through T+5 Close",
+                },
+                "acceleration_corridors": {
+                    "trigger_strike": 145.0,
+                    "upper_squeeze_wall": 165.0,
+                    "lower_gamma_trap": 132.0,
+                    "acceleration_slope": 1.85,
+                },
+                "is_actionable": True,
+                "provenance": "live_exchange_feed",
+                "safety_status": "ACTIONABLE",
+                "recommended_action": "ENTER_5DAY_SQUEEZE",
+            },
+            "backtesting_protocol": {
+                "purged_walk_forward_cv": {
+                    "train_folds": 5,
+                    "test_folds": 5,
+                    "embargo_days": 10,
+                    "is_purged": True,
+                },
+                "almgren_chriss_market_impact": {
+                    "temp_impact_bps": 14.5,
+                    "perm_impact_bps": 10.0,
+                    "half_life_decay": 0.5,
+                    "total_slippage_bps": 24.5,
+                },
+                "borrow_fee_engine": {
+                    "borrow_fee_bps": 65.0,
+                    "is_hard_to_borrow": False,
+                    "utilization_pct": 34.5,
+                    "annualized_cost": 0.65,
+                },
+                "deflated_sharpe_ratio": {
+                    "best_sharpe": 1.85,
+                    "expected_max_sharpe_hurdle": 1.30,
+                    "dsr_probability": 96.2,
+                    "n_trials": 240,
+                    "is_statistically_significant": True,
+                },
+                "verifiable_replication_event_panel": {
+                    "n_events": 128,
+                    "win_rate": 0.688,
+                    "profit_factor": 2.45,
+                    "cagr_pct": 28.5,
+                    "max_drawdown_pct": -9.8,
+                    "calmar_ratio": 2.91,
+                },
+                "strategy_rules": {
+                    "entry_rule": "T1 Market Open Limit Corridor",
+                    "exit_rule": "Upper Squeeze Wall or T+5 Close",
+                    "stop_loss_peg": "Lower Gamma Trap",
+                    "max_holding_period": 5,
+                },
+                "council_interrogation_outcomes": {
+                    "dr_vance": {"verdict": "APPROVED", "notes": "Post-earnings volatility surface calibrated with winsorized median."},
+                    "marcus_reynolds": {"verdict": "APPROVED", "notes": "Almgren-Chriss slippage and market impact validated."},
+                    "dr_rostova": {"verdict": "APPROVED", "notes": "Residual GSI orthogonalized from Fama-French factors; isotonic probability valid."},
+                    "julian_montgomery": {"verdict": "APPROVED", "notes": "No AMC close fill; borrow fee 65 bps general collateral."},
+                    "sophia_chen": {"verdict": "APPROVED", "notes": "SUE score +1.25 exceeds 0.5 beat hurdle."},
+                    "arthur_pendelton": {"verdict": "APPROVED", "notes": "Capital allocation approved with strict stop-loss peg."},
+                },
+            },
+            "evaluation_matrix": {
+                "t_plus_1_to_5": {
+                    "direction": "BULLISH",
+                    "conviction_score": 88.0,
+                    "expected_return_pct": 8.5,
+                    "sharpe_ratio": 2.15,
+                    "primary_driver": "Convex Dealer Delta Hedging Squeeze",
+                    "optimal_action": "Aggressive Tactical Buy at T1 Open",
+                    "risk_factors": ["Overnight binary announcement gap"],
+                },
+                "1M": {
+                    "direction": "BULLISH",
+                    "conviction_score": 78.0,
+                    "expected_return_pct": 6.2,
+                    "sharpe_ratio": 1.75,
+                    "primary_driver": "PEAD Earnings Momentum Drift",
+                    "optimal_action": "Hold through 30-day post-announcement window",
+                    "risk_factors": ["Macro CPI release volatility"],
+                },
+                "6M": {
+                    "direction": "ACCUMULATE",
+                    "conviction_score": 72.0,
+                    "expected_return_pct": 14.5,
+                    "sharpe_ratio": 1.45,
+                    "primary_driver": "Volume Profile Value Area Support",
+                    "optimal_action": "Accumulate on pullbacks to YTD AVWAP",
+                    "risk_factors": ["BOCD regime transition hazard"],
+                },
+                "1Y": {
+                    "direction": "BULLISH",
+                    "conviction_score": 75.0,
+                    "expected_return_pct": 22.0,
+                    "sharpe_ratio": 1.35,
+                    "primary_driver": "Fundamental Earnings Expansion & Compound Growth",
+                    "optimal_action": "Core institutional long allocation",
+                    "risk_factors": ["Sector rotation into defensives"],
+                },
+                "3Y": {
+                    "direction": "ACCUMULATE",
+                    "conviction_score": 70.0,
+                    "expected_return_pct": 58.0,
+                    "sharpe_ratio": 1.15,
+                    "primary_driver": "Structural Industry Trend & Secular Margin Expansion",
+                    "optimal_action": "Strategic cycle rebalancing",
+                    "risk_factors": ["Macroeconomic interest rate cycles"],
+                },
+                "10Y": {
+                    "direction": "BULLISH",
+                    "conviction_score": 80.0,
+                    "expected_return_pct": 195.0,
+                    "sharpe_ratio": 1.05,
+                    "primary_driver": "Durable Competitive Moat & Secular Reinvestment Rate",
+                    "optimal_action": "Permanent compounder holding",
+                    "risk_factors": ["Technological disruption"],
+                },
+            },
         }
 
     def test_resolve_json_path(self):
@@ -313,6 +477,17 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
             self.assertIn("const RAW_HISTORY = REPORT_DATA.historical_data || [];", html_text)
             self.assertIn("const BEST_BUYS = REPORT_DATA.best_buys || [];", html_text)
             self.assertIn("const PREDICTIVE = REPORT_DATA.predictive || {};", html_text)
+            self.assertIn("const GAMMA_SQUEEZE = REPORT_DATA.earnings_gamma_squeeze || {};", html_text)
+            self.assertIn("const BACKTESTING = REPORT_DATA.backtesting_protocol || {};", html_text)
+            self.assertIn("const EVALUATION_MATRIX = REPORT_DATA.evaluation_matrix || {};", html_text)
+
+            # Verify presence of institutional HTML sections
+            self.assertIn("EXECUTIVE BUY TIMING VERDICT BANNER", html_text)
+            self.assertIn("Should It Be Bought?", html_text)
+            self.assertIn("When Should It Be Bought?", html_text)
+            self.assertIn("Next-Day to Next-Week (t+1 to t+5) Gamma Squeeze &amp; 5-Day Upward Spike Radar", html_text)
+            self.assertIn("Multi-Horizon Institutional Conviction Matrix", html_text)
+            self.assertIn("Institutional Backtesting Protocol &amp; Quantitative Risk Audit", html_text)
 
             # Verify embedded payload can be extracted and parsed identically
             start_marker = '<script id="report-data" type="application/json">\n'
@@ -374,12 +549,87 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
         self.assertIn("Gamma Flip Point", deriv_html)
         self.assertIn("CALL WALL", deriv_html)
         self.assertEqual(build_derivatives_card_html(None), "")
+        self.assertEqual(build_derivatives_card_html(None, spot_price=0.0), "")
+
+        # Fallback calibration when derivatives is None but spot_price > 0
+        fallback_deriv_html = build_derivatives_card_html(None, spot_price=140.0)
+        self.assertIn("Institutional Derivatives &amp; Dealer Gamma Exposure (GEX)", fallback_deriv_html)
+        self.assertIn("CALIBRATED SYNTHETIC SURFACE", fallback_deriv_html)
+        self.assertIn("Gamma Flip Point", fallback_deriv_html)
 
         # 5. Events
         events_html = build_events_card_html(self.mock_analysis["events"])
         self.assertIn("Corporate Catalyst Awareness &amp; Event Risk (PEAD Models)", events_html)
         self.assertIn("Quarterly Earnings Surprise &amp; Post-Announcement Drift History", events_html)
         self.assertEqual(build_events_card_html(None), "")
+
+        # 6. Buy Timing Verdict Banner
+        banner_html = build_buy_timing_verdict_banner_html(
+            pred=self.mock_analysis["predictive"],
+            gamma_squeeze=self.mock_analysis["earnings_gamma_squeeze"],
+            eval_matrix=self.mock_analysis["evaluation_matrix"],
+            spot_price=140.0,
+        )
+        self.assertIn("EXECUTIVE BUY TIMING VERDICT BANNER", banner_html)
+        self.assertIn("Should It Be Bought?", banner_html)
+        self.assertIn("When Should It Be Bought?", banner_html)
+        self.assertIn("Optimal Entry Corridor", banner_html)
+        self.assertIn("Invalidation Stop-Loss", banner_html)
+        self.assertIn("5-Day Spike Potential", banner_html)
+        self.assertEqual(build_buy_timing_verdict_banner_html(None, None), "")
+
+        # Test Synthetic Provenance Safety Invariant in Verdict Banner
+        synth_gamma = dict(self.mock_analysis["earnings_gamma_squeeze"])
+        synth_gamma["provenance"] = "synthetic_research_fallback"
+        synth_gamma["safety_status"] = "ACTION_SUPPRESSED"
+        synth_banner = build_buy_timing_verdict_banner_html(
+            pred=self.mock_analysis["predictive"],
+            gamma_squeeze=synth_gamma,
+            spot_price=140.0,
+        )
+        self.assertIn("SAFETY INVARIANT: SYNTHETIC RESEARCH DATA", synth_banner)
+        self.assertIn("RESEARCH ONLY", synth_banner)
+
+        # 7. Gamma Squeeze & 5-Day Upward Spike Radar Card
+        spike_html = build_gamma_squeeze_spike_card_html(
+            self.mock_analysis["earnings_gamma_squeeze"],
+            spot_price=140.0,
+        )
+        self.assertIn("Next-Day to Next-Week (t+1 to t+5) Gamma Squeeze &amp; 5-Day Upward Spike Radar", spike_html)
+        self.assertIn("ACTIVE 5-DAY UPWARD SPIKE DETECTED", spike_html)
+        self.assertIn("Post-Earnings Vol Surface", spike_html)
+        self.assertIn("Forced Dealer Hedging", spike_html)
+        self.assertIn("Microstructure &amp; Liquidity", spike_html)
+        self.assertIn("5-Day Execution Clock", spike_html)
+        self.assertEqual(build_gamma_squeeze_spike_card_html(None), "")
+
+        # 8. Multi-Horizon Conviction Matrix
+        matrix_html = build_multi_horizon_matrix_card_html(self.mock_analysis["evaluation_matrix"])
+        self.assertIn("Multi-Horizon Institutional Conviction Matrix", matrix_html)
+        self.assertIn("Next-Day to Next-Week (5 Trading Days)", matrix_html)
+        self.assertIn("5-DAY RADAR", matrix_html)
+        self.assertIn("1 Month (21 Trading Days)", matrix_html)
+        self.assertIn("6 Months (126 Trading Days)", matrix_html)
+        self.assertIn("1 Year (252 Trading Days)", matrix_html)
+        self.assertIn("3 Years (756 Trading Days)", matrix_html)
+        self.assertIn("10 Years (2520 Trading Days)", matrix_html)
+        self.assertEqual(build_multi_horizon_matrix_card_html(None), "")
+
+        # 9. Institutional Backtesting Protocol & Quantitative Risk Audit Card
+        backtest_html = build_backtesting_protocol_card_html(self.mock_analysis["backtesting_protocol"])
+        self.assertIn("Institutional Backtesting Protocol &amp; Quantitative Risk Audit", backtest_html)
+        self.assertIn("Deflated Sharpe Prob", backtest_html)
+        self.assertIn("Purged Walk-Forward CV", backtest_html)
+        self.assertIn("Execution Impact Engine", backtest_html)
+        self.assertIn("Borrow Fee Engine", backtest_html)
+        self.assertIn("@team-finance Council Interrogation &amp; Audit Sign-Offs", backtest_html)
+        self.assertIn("Dr. Victoria Vance", backtest_html)
+        self.assertIn("Marcus Reynolds", backtest_html)
+        self.assertIn("Dr. Elena Rostova", backtest_html)
+        self.assertIn("Julian Montgomery", backtest_html)
+        self.assertIn("Sophia Chen", backtest_html)
+        self.assertIn("Arthur Pendelton III", backtest_html)
+        self.assertEqual(build_backtesting_protocol_card_html(None), "")
 
     def test_cli_from_json(self):
         from unittest.mock import patch
