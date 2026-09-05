@@ -44,8 +44,8 @@ Usage:
     python scripts/download_us_selected_data.py --symbols MSFT --target_dir ./raw_only --no-dump_qlib
 """
 
-import os
 import sys
+import re
 import time
 import json
 import logging
@@ -172,11 +172,20 @@ def load_symbols_from_file(file_path: Union[str, Path]) -> List[str]:
                     continue
                 # Split inline comments if any
                 line = line.split("#")[0].strip()
+                # Check for Qlib TSV/delimited instrument format: <SYMBOL>\t<START_DATE>\t<END_DATE>
                 parts = line.replace(",", " ").replace("\t", " ").split()
-                for p in parts:
-                    clean = p.strip().strip('"\'')
-                    if clean:
+                if not parts:
+                    continue
+                # If first token is followed by date tokens (YYYY-MM-DD), only extract the ticker symbol
+                if len(parts) >= 2 and any(re.match(r"^\d{4}-\d{2}-\d{2}$", p) for p in parts[1:]):
+                    clean = parts[0].strip().strip('"\'')
+                    if clean and not re.match(r"^\d{4}-\d{2}-\d{2}$", clean):
                         raw_symbols.append(clean)
+                else:
+                    for p in parts:
+                        clean = p.strip().strip('"\'')
+                        if clean and not re.match(r"^\d{4}-\d{2}-\d{2}$", clean):
+                            raw_symbols.append(clean)
 
     symbols = parse_symbols(raw_symbols)
     logger.info(f"Loaded {len(symbols)} tickers from file: {symbols}")
@@ -226,9 +235,13 @@ def parse_symbols(symbol_input: Union[str, List[str], Path]) -> List[str]:
     cleaned = []
     for s in raw_symbols:
         sym = s.strip().strip('"\'').upper()
-        if sym and sym not in seen:
-            seen.add(sym)
-            cleaned.append(sym)
+        if not sym or sym in seen:
+            continue
+        # Filter out dates (e.g. 2019-01-02) and pure numbers
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", sym) or sym.isdigit():
+            continue
+        seen.add(sym)
+        cleaned.append(sym)
     return cleaned
 
 
