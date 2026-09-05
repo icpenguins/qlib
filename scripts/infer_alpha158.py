@@ -219,8 +219,17 @@ class Alpha158Scorer:
         # Extract top factor drivers from metadata
         top_10 = self.metadata.get("top_10_features", [])
         top_factors = []
-        for item in top_10[:4]:
+        for item in top_10[:6]:
             feat = item.get("feature", "FACTOR")
+            if feat.startswith("Column_"):
+                try:
+                    from qlib.contrib.data.loader import Alpha158DL
+                    _, canonical_names = Alpha158DL.get_feature_config()
+                    col_idx = int(feat.split("_")[1])
+                    if col_idx < len(canonical_names):
+                        feat = canonical_names[col_idx]
+                except Exception:
+                    pass
             top_factors.append({
                 "factor": feat,
                 "gain": item.get("gain", 0.0),

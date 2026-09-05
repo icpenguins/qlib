@@ -205,8 +205,26 @@ def train_alpha158_model(
         try:
             trained_model.model.save_model(str(prod_model_txt))
             logger.info(f"Saved native LightGBM booster text to: {prod_model_txt.resolve()}")
-            feature_names = trained_model.model.feature_name()
+            raw_feature_names = trained_model.model.feature_name()
             importances = trained_model.model.feature_importance(importance_type="gain")
+            num_trees = trained_model.model.num_trees()
+            logger.info(f"Model Quality Check: num_trees={num_trees}")
+
+            # Map to canonical Alpha158 factor names if generic Column_i returned
+            from qlib.contrib.data.loader import Alpha158DL
+            _, canonical_names = Alpha158DL.get_feature_config()
+
+            feature_names = []
+            for i, fn in enumerate(raw_feature_names):
+                if fn.startswith("Column_"):
+                    try:
+                        col_idx = int(fn.split("_")[1])
+                        if col_idx < len(canonical_names):
+                            fn = canonical_names[col_idx]
+                    except (ValueError, IndexError):
+                        pass
+                feature_names.append(fn)
+
             feature_importances = [
                 {"feature": fn, "gain": float(gain)}
                 for fn, gain in sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
