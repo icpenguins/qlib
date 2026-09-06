@@ -107,7 +107,12 @@ def compute_event_risk_features(
         "next_earnings_date": catalyst_status.get("next_earnings_date"),
         "earnings_days_away": catalyst_status.get("earnings_days_away"),
         "earnings_proximity": catalyst_status.get("earnings_proximity"),
-        "recent_earnings_history": earnings_history[-4:] if earnings_history else [],
+        # Each row carries its own computed sue_score/announcement_gap_pct/drift_pct
+        # (same methodology as `pead_summary`'s most-recent-report figures) rather
+        # than raw, un-annotated earnings_history records.
+        "recent_earnings_history": pead_engine.evaluate_earnings_history(
+            df=df, earnings_history=earnings_history, current_date=curr_str,
+        ),
         "momentum_events": momentum_events,
         "catalyst_schedule": events_payload.get("catalyst_schedule", []),
     }

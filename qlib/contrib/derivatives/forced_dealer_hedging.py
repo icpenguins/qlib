@@ -9,10 +9,13 @@ Calculates the forced dealer hedging demand across spot-vol jump scenarios
 incorporating empirical IV crush and DTE decay across strike options.
 """
 
+import logging
 from typing import Dict, List, Any
 import numpy as np
 import pandas as pd
 from .gex import BlackScholesGreeks
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_forced_dealer_hedging_demand(
@@ -52,7 +55,13 @@ def calculate_forced_dealer_hedging_demand(
 
     if df_chain.empty or spot <= 0:
         return {
-            dS: {"shares_demand": 0.0, "lir": 0.0, "dollar_demand": 0.0}
+            dS: {
+                "shares_demand": 0.0,
+                "lir": 0.0,
+                "dollar_demand": 0.0,
+                "max_physical_shares_demand": 0.0,
+                "invariant_ok": True,
+            }
             for dS in jump_scenarios
         }
 
@@ -70,6 +79,16 @@ def calculate_forced_dealer_hedging_demand(
     else:
         delta_0_c = BlackScholesGreeks.calc_delta(spot, strikes, tau_0, ivs, is_call=True)
         delta_0_p = BlackScholesGreeks.calc_delta(spot, strikes, tau_0, ivs, is_call=False)
+
+    # Physical invariant: since BlackScholesGreeks.calc_delta returns exact-CDF
+    # deltas strictly bounded to [0, 1] for calls and [-1, 0] for puts, the largest
+    # possible |delta change| for any single leg is 1.0 (e.g. deep OTM -> deep ITM).
+    # Aggregate dealer share demand therefore cannot physically exceed 100 shares/
+    # contract times the chain's total open interest, even in the most extreme
+    # single-scenario case. A violation means the chain feeding this calculation is
+    # internally inconsistent (e.g. a mismatched/unnormalized synthetic surface),
+    # not a legitimate hedging estimate.
+    max_physical_shares_demand = 100.0 * float(ois_call.sum() + ois_put.sum())
 
     results = {}
     for dS in jump_scenarios:
@@ -92,10 +111,25 @@ def calculate_forced_dealer_hedging_demand(
         lir = abs(net_shares_demand) / effective_liquidity
         dollar_demand = net_shares_demand * S_new
 
+        invariant_ok = abs(net_shares_demand) <= max_physical_shares_demand + 1e-6
+        if not invariant_ok:
+            logger.warning(
+                "Forced dealer hedging demand invariant violated at jump %+.0f%%: "
+                "|%.0f| shares demanded exceeds the physical ceiling of %.0f shares "
+                "(100 x total chain OI of %.0f contracts). The options chain feeding "
+                "this calculation is internally inconsistent.",
+                dS * 100.0,
+                net_shares_demand,
+                max_physical_shares_demand,
+                ois_call.sum() + ois_put.sum(),
+            )
+
         results[dS] = {
             "shares_demand": round(net_shares_demand, 2),
             "lir": round(float(lir), 4),
             "dollar_demand": round(float(dollar_demand), 2),
+            "max_physical_shares_demand": round(max_physical_shares_demand, 2),
+            "invariant_ok": invariant_ok,
         }
 
     return results

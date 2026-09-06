@@ -179,6 +179,101 @@ class PEADEngine:
         }
 
     @staticmethod
+    def compute_report_reaction(
+        df_sorted: pd.DataFrame,
+        report_date: str,
+        drift_trading_days: int = 21,
+    ) -> Dict[str, Optional[float]]:
+        """
+        Compute the Day-1 announcement gap and a fixed N-trading-day post-earnings
+        drift for a single historical earnings report date.
+
+        Returns ``None`` for a field when the price history does not extend far
+        enough to compute it (e.g. the drift window runs past the last available
+        trading day), rather than fabricating a value.
+        """
+        date_matches = df_sorted.index[df_sorted["date"] >= report_date].tolist()
+        if not date_matches:
+            return {"announcement_gap_pct": None, "drift_pct": None}
+        ev_idx = date_matches[0]
+
+        gap_pct = None
+        if ev_idx > 0:
+            p_prior = float(df_sorted.loc[ev_idx - 1, "close"])
+            p_ev = float(df_sorted.loc[ev_idx, "close"])
+            if p_prior > 0:
+                gap_pct = round(((p_ev - p_prior) / p_prior) * 100.0, 2)
+
+        drift_pct = None
+        target_idx = ev_idx + drift_trading_days
+        if target_idx < len(df_sorted):
+            p_post = float(df_sorted.loc[ev_idx, "close"])
+            p_target = float(df_sorted.loc[target_idx, "close"])
+            if p_post > 0:
+                drift_pct = round(((p_target - p_post) / p_post) * 100.0, 2)
+
+        return {"announcement_gap_pct": gap_pct, "drift_pct": drift_pct}
+
+    def evaluate_earnings_history(
+        self,
+        df: pd.DataFrame,
+        earnings_history: List[Dict[str, Any]],
+        current_date: Union[str, datetime.date, pd.Timestamp],
+        lookback: int = 4,
+        drift_trading_days: int = 21,
+    ) -> List[Dict[str, Any]]:
+        """
+        Annotate the most recent ``lookback`` earnings reports with SUE score,
+        Day-1 announcement gap, and a fixed ``drift_trading_days``-trading-day
+        post-earnings drift -- computed with the same methodology
+        :meth:`evaluate_recent_pead` uses for the single most recent report, so
+        the per-quarter history table and the "most recent report" summary card
+        can never disagree about the same event.
+
+        Prior to this method, the per-quarter history rows fed to the report
+        template carried only raw EPS/surprise fields (see
+        ``events_data.py``'s synthetic generator) with no SUE/gap/drift computed
+        at all -- the template read nonexistent keys for those three fields and
+        always rendered "N/A", even though the most-recent-report summary card
+        (fed by :meth:`evaluate_recent_pead`) showed real numbers for what could
+        be the very same report.
+        """
+        if not earnings_history:
+            return []
+
+        curr_dt = pd.to_datetime(current_date).tz_localize(None).floor("D")
+        past_reports = []
+        for rep in earnings_history:
+            rep_dt = pd.to_datetime(rep.get("date") or rep.get("quarter")).tz_localize(None).floor("D")
+            if rep_dt <= curr_dt:
+                past_reports.append((rep_dt, rep))
+        past_reports.sort(key=lambda x: x[0], reverse=True)
+
+        df_sorted = df.copy().sort_values("date").reset_index(drop=True)
+        annotated = []
+        for i, (rep_dt, rep) in enumerate(past_reports[:lookback]):
+            act = float(rep.get("eps_actual", rep.get("actual", 0.0)))
+            est = float(rep.get("eps_estimate", rep.get("estimate", 0.0)))
+            surp_pct = float(rep.get("surprise_pct", rep.get("surprisePercent", 0.0)))
+            hist_diffs = [
+                float(r.get("eps_actual", r.get("actual", 0.0))) - float(r.get("eps_estimate", r.get("estimate", 0.0)))
+                for _, r in past_reports[i + 1 : i + 9]
+            ]
+            sue = self.compute_sue(act, est, hist_diffs)
+            reaction = self.compute_report_reaction(df_sorted, rep_dt.strftime("%Y-%m-%d"), drift_trading_days)
+
+            annotated.append({
+                "date": rep_dt.strftime("%Y-%m-%d"),
+                "eps_actual": round(act, 2),
+                "eps_estimate": round(est, 2),
+                "surprise_pct": round(surp_pct, 2),
+                "sue_score": sue,
+                "announcement_gap_pct": reaction["announcement_gap_pct"],
+                "drift_pct": reaction["drift_pct"],
+            })
+        return annotated
+
+    @staticmethod
     def extract_key_momentum_events(
         df: pd.DataFrame,
         earnings_history: Optional[List[Dict[str, Any]]] = None,

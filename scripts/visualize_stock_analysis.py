@@ -536,11 +536,25 @@ def build_derivatives_card_html(
     spot_price: float = 0.0,
     symbol: str = "",
     adtv: Optional[float] = None,
+    is_synthetic_or_suppressed: Optional[bool] = None,
 ) -> str:
     """
     Construct modular HTML container for Institutional Derivatives & Dealer Gamma Exposure (GEX).
     Guarantees that the GEX card is rendered whenever spot_price > 0, synthesizing a calibrated
     surface scaled to liquidity if external options feed is omitted.
+
+    Parameters
+    ----------
+    is_synthetic_or_suppressed : Optional[bool]
+        The single canonical "is this options surface synthetic / has the safety
+        gate suppressed action" signal, sourced from
+        `earnings_gamma_squeeze.provenance`/`safety_status` (see
+        `build_gamma_squeeze_spike_card_html`). When provided, this -- not
+        `derivatives.get('is_synthetic_surface')` -- drives the PROVENANCE badge,
+        so the header badge and the squeeze-radar section can never disagree about
+        whether the underlying data is live or synthetic. `derivatives`'s own flag
+        is used only as a fallback when the caller has no gamma-squeeze verdict to
+        pass (e.g. this card is rendered standalone).
     """
     if not derivatives:
         if spot_price <= 0.0:
@@ -618,9 +632,21 @@ def build_derivatives_card_html(
         </tr>
         """
 
+    # Canonical synthetic/suppressed signal: prefer the caller-supplied gamma-squeeze
+    # safety-gate verdict over this card's own `derivatives.is_synthetic_surface`
+    # flag. These two were previously computed by entirely independent pipeline
+    # stages and could disagree -- e.g. the header showing "LIVE EXCHANGE DATA
+    # (VERIFIED)" while the gamma-squeeze section's own gate had already detected
+    # and flagged a synthetic surface with `safety_status: ACTION_SUPPRESSED`.
+    is_synthetic = (
+        is_synthetic_or_suppressed
+        if is_synthetic_or_suppressed is not None
+        else bool(derivatives.get('is_synthetic_surface'))
+    )
+
     provenance_badge = (
         '<span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-500/10 text-amber-300 border-amber-500/30 font-mono">PROVENANCE: SYNTHETIC RESEARCH CHAIN (UNVERIFIED LIVE OPTIONS)</span>'
-        if derivatives.get('is_synthetic_surface') else
+        if is_synthetic else
         '<span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-emerald-500/10 text-emerald-300 border-emerald-500/30 font-mono">PROVENANCE: LIVE EXCHANGE DATA (VERIFIED)</span>'
     )
 
@@ -630,7 +656,7 @@ def build_derivatives_card_html(
           ⚠️ <strong>Research Provenance:</strong> Model-calibrated synthetic surface. Call/Put walls reflect theoretical open interest distributions scaled to ticker liquidity. For real-capital pinning or breakout execution, independent verification against live OPRA exchange data is required.
         </div>
         """
-        if derivatives.get('is_synthetic_surface') else ""
+        if is_synthetic else ""
     )
 
     return f"""
@@ -782,13 +808,43 @@ def build_events_card_html(events: Optional[Dict[str, Any]]) -> str:
     pead_info = events.get("pead") or {}
     degross_info = events.get("degrossing") or {}
 
-    status_code = cat_info.get("status_code", "SAFE")
-    status_desc = cat_info.get("status_description", "No imminent binary event risk within 5 business days.")
+    # NOTE: `status_code`/`status_description` are the COMPOSITE nearest-of-any-event
+    # (earnings, FOMC, or CPI, whichever is sooner) threat level -- e.g. if CPI is 5
+    # days away but earnings is 50 days away, the composite describes the CPI threat.
+    # This card's headline number (`days_earn`/`next_earn_date` below) is EARNINGS-
+    # specific, so its badge/description must be too, or the card contradicts
+    # itself (a "50 Days to Next Report" headline paired with a "Catalyst in 5
+    # days" description talking about a completely different, unnamed event).
+    # `earnings_status_code`/`earnings_status_description` (added to
+    # EventCalendarEngine.evaluate_catalyst_status) are earnings-only equivalents.
+    status_code = cat_info.get("earnings_status_code", cat_info.get("status_code", "SAFE"))
+    status_desc = cat_info.get(
+        "earnings_status_description",
+        cat_info.get("status_description", "No imminent binary event risk within 5 business days."),
+    )
     next_earn_date = cat_info.get("next_earnings_date") or events.get("next_earnings_date") or "TBD"
-    days_earn = cat_info.get("days_to_earnings") if cat_info.get("days_to_earnings") is not None else events.get("earnings_days_away")
-    next_macro_event = cat_info.get("next_macro_event", "FOMC / CPI")
-    next_macro_date = cat_info.get("next_macro_date", "TBD")
-    days_macro = cat_info.get("days_to_macro")
+    days_earn = cat_info.get("earnings_days_away") if cat_info.get("earnings_days_away") is not None else events.get("earnings_days_away")
+
+    # Macro Catalyst card: `next_macro_event`/`next_macro_date`/`days_to_macro` never
+    # existed as keys on `catalyst_status` -- derive the nearer-of-FOMC/CPI event from
+    # the real keys (`next_fomc_date`/`fomc_days_away`/`next_cpi_date`/`cpi_days_away`)
+    # instead of always falling through to the "FOMC / CPI" / "TBD" / None defaults.
+    fomc_days = cat_info.get("fomc_days_away")
+    cpi_days = cat_info.get("cpi_days_away")
+    if fomc_days is not None and (cpi_days is None or fomc_days <= cpi_days):
+        next_macro_event = "FOMC Rate Decision"
+        next_macro_date = cat_info.get("next_fomc_date") or "TBD"
+        days_macro = fomc_days
+    elif cpi_days is not None:
+        next_macro_event = "CPI Release"
+        next_macro_date = cat_info.get("next_cpi_date") or "TBD"
+        days_macro = cpi_days
+    else:
+        next_macro_event = "FOMC / CPI"
+        next_macro_date = "TBD"
+        days_macro = None
+    macro_status_code = cat_info.get("macro_status_code", "SAFE")
+    macro_status_desc = cat_info.get("macro_status_description", "")
 
     # Haircut & advice
     haircut = degross_info.get("position_haircut", events.get("degross_multiplier", 1.0))
@@ -809,6 +865,20 @@ def build_events_card_html(events: Optional[Dict[str, Any]]) -> str:
         badge_cat = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
         status_color = "text-emerald-400"
         pulse_color = "bg-emerald-400"
+
+    # Macro card badge styling -- previously always cyan/informational regardless
+    # of actual FOMC/CPI proximity, since the card had no proximity-aware styling.
+    if macro_status_code in ("CRITICAL_EVENT", "IMMINENT_DEGROSS"):
+        badge_macro = "bg-rose-500/10 text-rose-400 border-rose-500/30"
+    elif macro_status_code == "APPROACHING":
+        badge_macro = "bg-amber-500/10 text-amber-400 border-amber-500/30"
+    else:
+        badge_macro = "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"
+    macro_body_text = (
+        macro_status_desc
+        if macro_status_code != "SAFE" and macro_status_desc
+        else "Monitors FOMC interest rate decisions and CPI releases to prevent systemic factor shocks."
+    )
 
     # PEAD info
     pead_regime = pead_info.get("drift_regime", "NEUTRAL")
@@ -831,13 +901,18 @@ def build_events_card_html(events: Optional[Dict[str, Any]]) -> str:
     earn_history = events.get("recent_earnings_history", [])
     earn_rows_html = ""
     for h in reversed(earn_history[-4:]):
+        # NOTE: key names must match PEADEngine.evaluate_earnings_history's output
+        # exactly (qlib/contrib/events/pead.py) -- eps_actual/eps_estimate (not
+        # actual_eps/estimated_eps) and drift_pct (not drift_30d_pct). Reading the
+        # wrong keys here previously made every historical row silently render
+        # "N/A" regardless of the underlying data.
         dt = h.get("date", "N/A")
-        act = h.get("actual_eps")
-        est = h.get("estimated_eps")
+        act = h.get("eps_actual")
+        est = h.get("eps_estimate")
         surp = h.get("surprise_pct")
         h_sue = h.get("sue_score")
         h_gap = h.get("announcement_gap_pct")
-        h_drift = h.get("drift_30d_pct")
+        h_drift = h.get("drift_pct")
 
         act_str = f"${act:.2f}" if act is not None else "N/A"
         est_str = f"${est:.2f}" if est is not None else "N/A"
@@ -912,7 +987,7 @@ def build_events_card_html(events: Optional[Dict[str, Any]]) -> str:
           <div>
             <div class="flex justify-between items-center mb-1">
               <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Macro Catalyst</span>
-              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-cyan-500/10 text-cyan-400 border-cyan-500/30">
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {badge_macro}">
                 {next_macro_event}
               </span>
             </div>
@@ -924,7 +999,7 @@ def build_events_card_html(events: Optional[Dict[str, Any]]) -> str:
             </div>
           </div>
           <div class="text-[11px] text-gray-400 border-t border-gray-800/80 pt-2 mt-3 leading-relaxed">
-            Monitors FOMC interest rate decisions and CPI releases to prevent systemic factor shocks.
+            {macro_body_text}
           </div>
         </div>
 
@@ -988,7 +1063,7 @@ def build_events_card_html(events: Optional[Dict[str, Any]]) -> str:
                 <th class="py-1 px-3 text-right">SURPRISE %</th>
                 <th class="py-1 px-3 text-right">SUE SCORE</th>
                 <th class="py-1 px-3 text-right">ANNOUNCEMENT GAP</th>
-                <th class="py-1 px-3 text-right">30D POST DRIFT</th>
+                <th class="py-1 px-3 text-right">21D POST DRIFT</th>
               </tr>
             </thead>
             <tbody>
@@ -1544,17 +1619,22 @@ def build_gamma_squeeze_spike_card_html(
         lower_trap = round(spot_price * 0.95, 2)
 
     dealer_shares = forced.get("dealer_shares_to_buy")
+    dealer_scenario_pct = 10.0
+    dealer_invariant_ok = True
     if dealer_shares is None:
         scen_bull = forced.get("scenarios", {}).get(0.10, {}) or forced.get(0.10, {})
         dealer_shares = int(round(scen_bull.get("shares_demand", 0.0)))
         dealer_dollar = float(scen_bull.get("dollar_demand", 0.0))
         pct_adtv = float(scen_bull.get("lir", 0.0) * 100.0)
         dealer_velocity = "Moderate"
+        dealer_invariant_ok = bool(scen_bull.get("invariant_ok", True))
     else:
         dealer_shares = int(dealer_shares)
         dealer_dollar = float(forced.get("dealer_dollar_demand", 0.0))
         pct_adtv = float(forced.get("pct_adtv_demand", 0.0))
         dealer_velocity = forced.get("dealer_hedging_velocity", "Moderate")
+        dealer_scenario_pct = float(forced.get("dealer_hedging_scenario_pct", 10.0))
+        dealer_invariant_ok = bool(forced.get("invariant_ok", True))
 
     spread_bps = liq.get("expected_spread_widening_bps", 0.0)
     slippage_bps = liq.get("expected_slippage_bps", 0.0)
@@ -1616,11 +1696,19 @@ def build_gamma_squeeze_spike_card_html(
       <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-4 bg-gray-900/90 border border-gray-800/80 rounded-xl p-3 text-xs font-mono">
         <div>
           <span class="text-gray-500 block text-[10px] uppercase">Calibrated P(Squeeze)</span>
-          <span class="text-base font-bold {'text-emerald-400' if prob_squeeze >= 60 else 'text-gray-300'}">{prob_squeeze:.1f}%</span>
+          {
+            f'<span class="text-base font-bold text-rose-400">SUPPRESSED</span>'
+            if is_cap_pres else
+            f'<span class="text-base font-bold {"text-emerald-400" if prob_squeeze >= 60 else "text-gray-300"}">{prob_squeeze:.1f}%</span>'
+          }
         </div>
         <div>
           <span class="text-gray-500 block text-[10px] uppercase">Positive GSI (GSI+)</span>
-          <span class="text-base font-bold {'text-emerald-400' if gsi_pos >= 60 else 'text-gray-300'}">{gsi_pos:.1f} / 100</span>
+          {
+            f'<span class="text-base font-bold text-rose-400">SUPPRESSED</span>'
+            if is_cap_pres else
+            f'<span class="text-base font-bold {"text-emerald-400" if gsi_pos >= 60 else "text-gray-300"}">{gsi_pos:.1f} / 100</span>'
+          }
         </div>
         <div>
           <span class="text-gray-500 block text-[10px] uppercase">Residual GSI (Idiosyncratic)</span>
@@ -1677,14 +1765,15 @@ def build_gamma_squeeze_spike_card_html(
           <div>
             <div class="flex justify-between items-center mb-1">
               <span class="text-[11px] font-bold text-gray-400 uppercase tracking-wider">Forced Dealer Hedging</span>
-              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-cyan-500/10 text-cyan-300 border-cyan-500/30 font-mono">Gamma Convexity</span>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {'bg-cyan-500/10 text-cyan-300 border-cyan-500/30' if dealer_invariant_ok else 'bg-rose-500/10 text-rose-400 border-rose-500/30'} font-mono">{'Gamma Convexity' if dealer_invariant_ok else 'INVARIANT VIOLATED'}</span>
             </div>
             <div class="text-lg font-black text-white mt-1">
               {dealer_shares:,} <span class="text-xs font-normal text-gray-400">Shares Demand</span>
             </div>
+            {'' if dealer_invariant_ok else '<div class="text-[10px] text-rose-400 font-mono mt-0.5">Exceeds physical open-interest ceiling -- see backtesting protocol council notes (Marcus Reynolds)</div>'}
             <div class="space-y-1 mt-2 text-xs border-t border-gray-800/80 pt-2">
               <div class="flex justify-between text-gray-400">
-                <span>Dollar Hedging Demand:</span>
+                <span>Dollar Demand (at +{dealer_scenario_pct:.0f}% Spot Scenario):</span>
                 <span class="text-white font-mono">${dealer_dollar/1e6:.1f}M</span>
               </div>
               <div class="flex justify-between text-gray-400">
@@ -1901,9 +1990,13 @@ def build_backtesting_protocol_card_html(backtest: Optional[Dict[str, Any]]) -> 
     council = backtest.get("council_interrogation_outcomes", {})
 
     # DSR metrics
+    # NOTE: `dsr_probability` is stored as a fraction in [0, 1] (see
+    # qlib/contrib/backtest/deflated_sharpe_ratio.py), so it must be scaled by 100
+    # for display -- the same way `win_rate` is scaled below. Rendering it unscaled
+    # previously showed e.g. 0.9% for a probability of 0.8507 (85.1%).
     best_sharpe = float(dsr.get("best_sharpe", 0.0))
     hurdle = float(dsr.get("expected_max_sharpe_hurdle", 0.0))
-    dsr_prob = float(dsr.get("dsr_probability", 0.0))
+    dsr_prob = float(dsr.get("dsr_probability", 0.0)) * 100.0
     n_trials = int(dsr.get("n_trials", 0))
     is_sig = bool(dsr.get("is_statistically_significant", False))
 
@@ -1917,15 +2010,26 @@ def build_backtesting_protocol_card_html(backtest: Optional[Dict[str, Any]]) -> 
     cagr_pct = float(panel.get("cagr_pct", 0.0))
     max_dd = float(panel.get("max_drawdown_pct", 0.0))
 
-    # Purged CV metrics
-    train_folds = int(purged_cv.get("train_folds", 5))
-    test_folds = int(purged_cv.get("test_folds", 5))
+    # Purged CV metrics.
+    # NOTE: the engine emits a single expanding-window fold count (`n_folds`) plus
+    # each fold's train/test window length in days -- there is no separate
+    # train-fold-count/test-fold-count pair. `train_folds`/`test_folds` never
+    # existed in the payload, so this previously always rendered the "5 Train / 5
+    # Test Folds" defaults regardless of the real n_folds=7.
+    n_folds = int(purged_cv.get("n_folds", 0))
+    train_window_days = int(purged_cv.get("train_window_days", 0))
+    test_window_days = int(purged_cv.get("test_window_days", 0))
     embargo = int(purged_cv.get("embargo_days", 10))
 
-    # Impact metrics
-    temp_bps = float(impact.get("temp_impact_bps", 0.0))
-    perm_bps = float(impact.get("perm_impact_bps", 0.0))
-    tot_slip = float(impact.get("total_slippage_bps", 0.0))
+    # Impact metrics -- keys corrected to match
+    # qlib/contrib/microstructure/almgren_chriss_impact.py::calculate_impact's
+    # actual return schema (temporary_impact_bps / permanent_impact_bps /
+    # total_cost_bps). The previous keys (temp_impact_bps / perm_impact_bps /
+    # total_slippage_bps) do not exist in that schema and always fell through to
+    # the 0.0 defaults.
+    temp_bps = float(impact.get("temporary_impact_bps", 0.0))
+    perm_bps = float(impact.get("permanent_impact_bps", 0.0))
+    tot_slip = float(impact.get("total_cost_bps", 0.0))
 
     # Borrow metrics
     borrow_fee = float(borrow.get("borrow_fee_bps", 0.0))
@@ -1943,8 +2047,16 @@ def build_backtesting_protocol_card_html(backtest: Optional[Dict[str, Any]]) -> 
     ]
 
     council_cards_html = ""
+    n_approved = 0
     for name, title, focus, audit in members:
+        # NOTE: `audit` now comes from real per-member checks computed in
+        # earnings_gamma_squeeze_engine.py::_build_council_verdicts -- the
+        # "APPROVED" / boilerplate-notes defaults below only fire if a member key
+        # is genuinely absent (e.g. an older cached JSON payload), not for every
+        # report as before.
         verdict = audit.get("verdict", "APPROVED").upper()
+        if "APPROV" in verdict:
+            n_approved += 1
         v_class = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" if "APPROV" in verdict else (
             "bg-amber-500/10 text-amber-400 border-amber-500/30" if "CAUTION" in verdict else "bg-rose-500/10 text-rose-400 border-rose-500/30"
         )
@@ -2019,9 +2131,13 @@ def build_backtesting_protocol_card_html(backtest: Optional[Dict[str, Any]]) -> 
               <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-cyan-500/10 text-cyan-300 border-cyan-500/30 font-mono">No Leakage</span>
             </div>
             <div class="text-base font-bold text-white mt-1">
-              {train_folds} Train / {test_folds} Test Folds
+              {n_folds} Expanding-Window Folds
             </div>
             <div class="space-y-1 mt-2 text-xs border-t border-gray-800/80 pt-2 font-mono">
+              <div class="flex justify-between text-gray-400">
+                <span>Train / Test Window:</span>
+                <span class="text-white">{train_window_days}D / {test_window_days}D</span>
+              </div>
               <div class="flex justify-between text-gray-400">
                 <span>Embargo Period:</span>
                 <span class="text-white">{embargo} Days</span>
@@ -2106,7 +2222,7 @@ def build_backtesting_protocol_card_html(backtest: Optional[Dict[str, Any]]) -> 
       <div class="bg-gray-900/60 border border-gray-800/80 rounded-xl p-4">
         <div class="flex justify-between items-center mb-3">
           <span class="text-xs font-bold text-gray-300 uppercase tracking-wider">@team-finance Council Interrogation &amp; Audit Sign-Offs</span>
-          <span class="text-[10px] text-emerald-400 font-mono">6 Council Members &bull; 100% Invariant Validation</span>
+          <span class="text-[10px] {'text-emerald-400' if n_approved == len(members) else 'text-amber-400'} font-mono">{len(members)} Council Members &bull; {n_approved}/{len(members)} Approved</span>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           {council_cards_html}
@@ -2231,7 +2347,24 @@ def generate_html_dashboard(
     proj_cards_html = build_projection_cards_html(projections)
     regime_html = build_regime_card_html(regime)
     micro_html = build_microstructure_card_html(micro)
-    derivatives_html = build_derivatives_card_html(derivatives, spot_price=spot_price, symbol=symbol, adtv=adtv_val)
+    # Single canonical synthetic/suppressed signal shared with the derivatives card's
+    # PROVENANCE badge (see build_derivatives_card_html) and the gamma-squeeze
+    # section's own gate check below, so they can never disagree.
+    is_synthetic_or_suppressed = bool(
+        gamma_squeeze
+        and (
+            gamma_squeeze.get("provenance") == "synthetic_research_fallback"
+            or gamma_squeeze.get("safety_status") == "ACTION_SUPPRESSED"
+            or not gamma_squeeze.get("is_actionable", True)
+        )
+    )
+    derivatives_html = build_derivatives_card_html(
+        derivatives,
+        spot_price=spot_price,
+        symbol=symbol,
+        adtv=adtv_val,
+        is_synthetic_or_suppressed=is_synthetic_or_suppressed,
+    )
     events_html = build_events_card_html(events)
     alpha158_data = canonical_data.get("alpha158", {})
     alpha158_html = build_alpha158_card_html(alpha158_data)

@@ -227,6 +227,16 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
     else:
         history_payload = []
 
+    # Shared synthetic options chain, generated at most once per report and reused
+    # by both the GEX/derivatives card and evaluate_earnings_gamma_squeeze below.
+    # Previously each built its own independent synthetic chain (same seed and,
+    # coincidentally, matching parameters today -- but nothing enforced that, so a
+    # future parameter drift between the two call sites could silently make the
+    # report's "Total OI" figures and its dealer-hedging-demand figures describe
+    # two different chains). Sharing one object removes that failure mode entirely.
+    synthetic_chain_for_report: Optional[pd.DataFrame] = None
+    synthetic_chain_spot: float = 0.0
+
     derivatives = analysis_data.get("derivatives")
     if not derivatives:
         spot_val = 0.0
@@ -251,6 +261,8 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
                         symbol=symbol,
                         adtv=adtv_val,
                     )
+                    synthetic_chain_for_report = chain
+                    synthetic_chain_spot = spot_val
                     engine = DealerGammaEngine()
                     derivatives = engine.compute_gex(chain, spot_price=spot_val)
                     if VolatilitySurfaceFeatures is not None:
@@ -298,7 +310,12 @@ def prepare_analysis_json_payload(analysis_data: Dict[str, Any]) -> Dict[str, An
 
             prov_val = DataProvenance.SYNTHETIC_RESEARCH_FALLBACK if DataProvenance else "synthetic_research_fallback"
             chain_to_pass = pd.DataFrame()
-            if SyntheticOptionSurfaceGenerator is not None:
+            if synthetic_chain_for_report is not None and synthetic_chain_spot == last_price:
+                # Reuse the exact same chain the GEX/derivatives card was built
+                # from, rather than generating an independent one -- see the
+                # `synthetic_chain_for_report` note above.
+                chain_to_pass = synthetic_chain_for_report
+            elif SyntheticOptionSurfaceGenerator is not None:
                 try:
                     chain_to_pass = SyntheticOptionSurfaceGenerator.generate_synthetic_chain(
                         spot_price=last_price,

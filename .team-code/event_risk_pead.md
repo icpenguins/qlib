@@ -82,6 +82,62 @@ Where mu_SUE = 0.003 * SUE reflects earnings drift asymmetry and 2.5 * sigma_dai
 ### 5. compute_event_risk_features
 - **Location**: [qlib/contrib/events/__init__.py](file:///e:/SRC/GITHUB/my-qlib/qlib/contrib/events/__init__.py)
 - Master orchestrator returning catalyst status, degrossing factors, PEAD dynamics, and momentum events.
+- `recent_earnings_history` (added 2026-09-05): now built via
+  `PEADEngine.evaluate_earnings_history` (see below) instead of a raw,
+  un-annotated slice of `earnings_history`.
+
+### 6. PEADEngine.evaluate_earnings_history / compute_report_reaction (added 2026-09-05)
+- **Location**: [qlib/contrib/events/pead.py](file:///e:/SRC/GITHUB/my-qlib/qlib/contrib/events/pead.py)
+- **Why**: An adversarial report audit found the rendered "Quarterly Earnings
+  Surprise & Post-Announcement Drift History" table showed `N/A` for SUE Score,
+  Announcement Gap, and 30D Post Drift on every historical row, while the
+  adjacent "most recent report" summary card confidently showed real numbers
+  (SUE +0.79, Gap +2.69%, Drift -9.23%) for what could be the same event. Root
+  cause: the render loop (`scripts/visualize_stock_analysis.py::build_events_card_html`)
+  read `sue_score`/`announcement_gap_pct`/`drift_30d_pct` keys that were never
+  computed anywhere in the raw `earnings_history` records emitted by
+  `events_data.py` (which only carries `eps_actual`/`eps_estimate`/`surprise_pct`
+  per quarter) -- and separately read `actual_eps`/`estimated_eps`, the reverse
+  word order of the real `eps_actual`/`eps_estimate` keys.
+- `compute_report_reaction(df_sorted, report_date, drift_trading_days=21)`:
+  computes the Day-1 announcement gap and a **fixed** N-trading-day post-earnings
+  drift for one historical report date. Returns `None` (not a fabricated 0.0) for
+  a field the available price history cannot support (e.g. the drift window runs
+  past the last trading day).
+- `evaluate_earnings_history(df, earnings_history, current_date, lookback=4, drift_trading_days=21)`:
+  annotates the most recent `lookback` reports with `sue_score` (via the same
+  `compute_sue` used for the summary card), `announcement_gap_pct`, and
+  `drift_pct` -- using the *same methodology* `evaluate_recent_pead` uses for the
+  single most-recent report, so the history table and the summary card can never
+  disagree about the same event. Output keys: `date`, `eps_actual`, `eps_estimate`,
+  `surprise_pct`, `sue_score`, `announcement_gap_pct`, `drift_pct` (render side
+  updated to match -- the history table's "30D POST DRIFT" column header is now
+  "21D POST DRIFT" to reflect the actual fixed window used).
+
+### 7. EventCalendarEngine.evaluate_catalyst_status -- per-event fields (added 2026-09-05)
+- **Location**: [qlib/contrib/events/event_calendar.py](file:///e:/SRC/GITHUB/my-qlib/qlib/contrib/events/event_calendar.py)
+- **Why**: The same audit found the "Catalyst Proximity" (earnings) card showing
+  "50 Days to Next Report - SAFE" with a description directly beneath it reading
+  "APPROACHING EVENT: Catalyst in 5 days" -- a contradiction. Two independent
+  causes, both fixed:
+  1. `status_code` never existed as a returned key (only `composite_proximity`
+     did), so every consumer reading `.get("status_code", "SAFE")` -- the
+     earnings card's own badge color, and `scripts/stock_analysis_engine.py`'s
+     near-term event-driven volatility/haircut sizing -- silently always saw
+     "SAFE" regardless of the true nearest-event threat level.
+  2. `status_description` is a **composite** message about whichever of
+     {earnings, FOMC, CPI} is nearest, with no indication of which -- rendering
+     it under the earnings-specific card produced exactly the contradiction
+     above when a macro event was the actual trigger.
+- New return keys: `status_code` (alias for `composite_proximity`, fixing (1));
+  `earnings_status_code`/`earnings_status_description` and
+  `macro_status_code`/`macro_status_description` (event-specific equivalents,
+  fixing (2), via the new `_describe_single_event` helper). The render side
+  (`build_events_card_html`) now sources the earnings card from the
+  `earnings_*` keys and the macro card from the `macro_*` keys plus the real
+  `next_fomc_date`/`fomc_days_away`/`next_cpi_date`/`cpi_days_away` fields
+  (the macro card previously read `next_macro_event`/`next_macro_date`/
+  `days_to_macro`, none of which ever existed either).
 
 ---
 

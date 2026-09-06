@@ -45,3 +45,46 @@ def evaluate_earnings_gamma_squeeze(
 - Invariant: If provenance is `SYNTHETIC_RESEARCH_FALLBACK`, output sets `is_actionable = False`, sets `recommended_action = "RESEARCH_ONLY_NO_ACTION"`, and leaves probability fields `None`.
 - Invariant: Generates fully validated Contract Schema v1.1.0 payloads with all required sub-dictionaries.
 
+## 5. `council_interrogation_outcomes` -- real per-member verdicts (added 2026-09-05)
+
+`backtest.council_interrogation_outcomes` previously contained only five keys
+(`high_earning_trader`, `quant_developer`, `top_hedge_fund_manager`,
+`global_finance_manager`, `council_multi_horizon_consensus`) holding static
+illustrative numbers. The rendered report (`build_backtesting_protocol_card_html`
+in `scripts/visualize_stock_analysis.py`) displays six *named* council members
+(Dr. Victoria Vance, Marcus Reynolds, Dr. Elena Rostova, Julian Montgomery,
+Sophia Chen, Arthur Pendelton III) looked up by keys (`dr_vance`,
+`marcus_reynolds`, `dr_rostova`, `julian_montgomery`, `sophia_chen`,
+`arthur_pendelton`) that **did not exist in this payload at all** -- every
+`council.get(<name>, {})` returned `{}`, so every member's verdict/notes
+unconditionally hit the render side's hardcoded `"APPROVED"` /
+`"Quantitative standards validated. Invariants enforced."` defaults, regardless
+of any real invariant violation (including the ones an adversarial audit found
+elsewhere in the same report -- the dealer-hedging OI-ceiling violation and the
+zero-slippage Almgren-Chriss anomaly among them). This made the council section a
+structurally-incapable-of-failing rubber stamp.
+
+`_build_council_verdicts(...)` (module-private helper in this file) now computes
+each of the six member keys from a real, specific check against that member's
+stated audit focus, using values already computed earlier in this function:
+
+| Member | Focus | Verdict driven by |
+|---|---|---|
+| `dr_vance` | Derivatives & Vol Surface | `guard_result.safety_status` / `is_actionable` |
+| `marcus_reynolds` | Execution & Slippage | `forced_dealer_payload.invariant_ok` (the OI-ceiling check, see [calculate_forced_dealer_hedging_demand.md](calculate_forced_dealer_hedging_demand.md)) and `impact_meta.total_cost_bps` being implausibly zero |
+| `dr_rostova` | Isotonic Calibration & Ortho | `bounds_bull` well-ordered; `factor_ortho_payload.idiosyncratic_alpha_ratio` in `[0, 1]` |
+| `julian_montgomery` | Short Locate & HTB Borrow | `borrow_meta.is_hard_to_borrow` |
+| `sophia_chen` | SUE Score & Accounting | `sue_score` not saturated at the +/-10 clip ceiling |
+| `arthur_pendelton` | Bottom-Line Capital Allocation | `is_actionable` (ties directly back to the P(Squeeze)-vs-verdict contradiction the same audit flagged) |
+
+This computation must run **after** `forced_dealer_payload` is built (a few
+sections later in the function) -- it is merged into
+`backtesting_protocol_payload["council_interrogation_outcomes"]` via `.update()`
+just before the function's final `return`, not inlined into the dict literal
+where the five legacy keys are defined.
+
+The render side (`scripts/visualize_stock_analysis.py`) also no longer hardcodes
+"100% Invariant Validation" in the council panel header -- it now counts real
+`APPROVED` verdicts out of the six and reports `{n_approved}/{6} Approved`,
+switching to amber when fewer than all six approve.
+

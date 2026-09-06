@@ -829,8 +829,25 @@ def train_alpha158_model(
             if "instrument" in scores_df.columns:
                 scores_df.rename(columns={"instrument": "symbol"}, inplace=True)
 
-            # Compute cross-sectional ranks and percentiles per date
-            scores_df["rank"] = scores_df.groupby("date")["score"].rank(ascending=False, method="dense").astype(int)
+            # Compute cross-sectional ranks and percentiles per date.
+            #
+            # NOTE on `method`: this model's score distribution is known to be
+            # degenerate (see .team-code/20260905-finance_team_review_alpha158_degenerate_score.md
+            # -- e.g. on 2026-09-04, only 232 distinct scores across 908 names,
+            # with ties up to 120-wide). `method="dense"` ranks *distinct values*
+            # (1, 2, 3, ... with no gaps for ties), so under this much degeneracy
+            # it stops meaning "Nth best of the universe" at all -- it becomes
+            # "Nth distinct score value", compressing the reported rank far below
+            # where `percentile` (which correctly divides by the full universe
+            # size) puts the same row. That divergence is what an adversarial
+            # audit flagged as rank 179 of 908 (dense) implying an ~80th
+            # percentile while the stored `percentile` column correctly showed
+            # ~52%. `method="min"` (standard competition ranking: a tied group
+            # all takes the best rank in the group, next distinct value resumes
+            # at group_size + previous_rank) keeps `rank` consistent with
+            # `percentile` regardless of tie width, and rank 1 still means "the
+            # single best score" the way a human expects.
+            scores_df["rank"] = scores_df.groupby("date")["score"].rank(ascending=False, method="min").astype(int)
             scores_df["percentile"] = (
                 scores_df.groupby("date")["score"].rank(pct=True, ascending=True) * 100.0
             ).round(2)

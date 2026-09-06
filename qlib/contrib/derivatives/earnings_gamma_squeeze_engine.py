@@ -35,6 +35,129 @@ from ..backtest.borrow_fee_engine import calculate_borrow_cost
 from ..backtest.deflated_sharpe_ratio import calculate_deflated_sharpe_ratio
 from ..backtest.purged_walk_forward_cv import PurgedWalkForwardCV
 
+_APPROVED = "APPROVED"
+_CAUTION = "CAUTION"
+
+
+def _build_council_verdicts(
+    is_actionable: bool,
+    guard_result: Dict[str, Any],
+    forced_dealer_payload: Dict[str, Any],
+    impact_meta: Dict[str, Any],
+    bounds_bull: List[float],
+    factor_ortho_payload: Dict[str, Any],
+    borrow_meta: Dict[str, Any],
+    sue_score: float,
+) -> Dict[str, Any]:
+    """
+    Derives each named council member's verdict/notes from a real, specific check
+    against that member's stated audit focus, using values already computed
+    elsewhere in :func:`evaluate_earnings_gamma_squeeze`. See the caller for why
+    this replaced a set of member keys the render layer could never actually
+    reach. Returned as a dict of just the six named-member entries; the caller
+    merges this into the existing legacy-keyed council payload.
+    """
+    verdicts: Dict[str, Dict[str, str]] = {}
+
+    # Dr. Victoria Vance -- Derivatives & Vol Surface
+    if guard_result.get("safety_status") == "ACTION_SUPPRESSED" or not is_actionable:
+        verdicts["dr_vance"] = {
+            "verdict": _CAUTION,
+            "notes": (
+                f"Provenance gate flagged this surface ({guard_result.get('provenance_tier')}); "
+                "action suppressed. Vol surface is research-only until live OPRA data verifies."
+            ),
+        }
+    else:
+        verdicts["dr_vance"] = {
+            "verdict": _APPROVED,
+            "notes": "Live-provenance surface passed the data quality gate. Vol surface calibration nominal.",
+        }
+
+    # Marcus Reynolds -- Execution & Slippage
+    dealer_invariant_ok = bool(forced_dealer_payload.get("invariant_ok", True))
+    zero_slippage_anomaly = float(impact_meta.get("total_cost_bps", 0.0)) <= 0.0
+    if not dealer_invariant_ok:
+        verdicts["marcus_reynolds"] = {
+            "verdict": _CAUTION,
+            "notes": (
+                f"Dealer hedging demand ({forced_dealer_payload.get('dealer_shares_to_buy', 0):,} shares) "
+                f"exceeds the physical open-interest ceiling "
+                f"({forced_dealer_payload.get('max_physical_shares_demand', 0):,.0f} shares). "
+                "Execution sizing against this figure is invalid until the chain is reconciled."
+            ),
+        }
+    elif zero_slippage_anomaly:
+        verdicts["marcus_reynolds"] = {
+            "verdict": _CAUTION,
+            "notes": "Almgren-Chriss total cost resolved to 0.0 bps for a non-trivial trade size; investigate before sizing execution.",
+        }
+    else:
+        verdicts["marcus_reynolds"] = {
+            "verdict": _APPROVED,
+            "notes": (
+                f"Dealer demand within physical OI ceiling; Almgren-Chriss total impact "
+                f"{impact_meta.get('total_cost_bps', 0.0):.1f} bps is plausible for the sized trade."
+            ),
+        }
+
+    # Dr. Elena Rostova -- Isotonic Calibration & Orthogonalization
+    bounds_ok = len(bounds_bull) == 2 and bounds_bull[0] <= bounds_bull[1]
+    idio_ratio = float(factor_ortho_payload.get("idiosyncratic_alpha_ratio", 0.0))
+    idio_ok = 0.0 <= idio_ratio <= 1.0
+    if bounds_ok and idio_ok:
+        verdicts["dr_rostova"] = {
+            "verdict": _APPROVED,
+            "notes": f"Conformal bounds well-ordered; idiosyncratic alpha ratio {idio_ratio:.2f} within [0, 1].",
+        }
+    else:
+        verdicts["dr_rostova"] = {
+            "verdict": _CAUTION,
+            "notes": "Conformal coverage bounds or factor-orthogonalization ratio failed a sanity check -- recalibrate before trusting GSI+.",
+        }
+
+    # Julian Montgomery -- Short Locate & HTB Borrow
+    if borrow_meta.get("is_hard_to_borrow", False):
+        verdicts["julian_montgomery"] = {
+            "verdict": _CAUTION,
+            "notes": (
+                f"Security is Hard-to-Borrow (locate_granted={borrow_meta.get('locate_granted')}); "
+                f"annual borrow rate {float(borrow_meta.get('annual_fee_rate', 0.0)) * 100.0:.2f}%. "
+                "Short-side execution requires confirmed locate before entry."
+            ),
+        }
+    else:
+        verdicts["julian_montgomery"] = {
+            "verdict": _APPROVED,
+            "notes": "General collateral; no locate constraint on short-side execution.",
+        }
+
+    # Sophia Chen -- SUE Score & Accounting
+    if abs(sue_score) >= 10.0:
+        verdicts["sophia_chen"] = {
+            "verdict": _CAUTION,
+            "notes": f"SUE score {sue_score:+.2f} is saturated at the clip ceiling -- underlying EPS/estimate inputs need review.",
+        }
+    else:
+        verdicts["sophia_chen"] = {
+            "verdict": _APPROVED,
+            "notes": f"SUE score {sue_score:+.2f} within normal bounds; no accounting anomaly detected.",
+        }
+
+    # Arthur Pendelton III -- Bottom-Line Capital Allocation
+    if not is_actionable:
+        verdicts["arthur_pendelton"] = {
+            "verdict": _CAUTION,
+            "notes": "Safety gate suppressed action on this ticker -- no capital should be allocated regardless of any bullish sub-model output shown elsewhere on this report.",
+        }
+    else:
+        verdicts["arthur_pendelton"] = {
+            "verdict": _APPROVED,
+            "notes": "Actionable per the safety gate; sizing subject to the Execution & Borrow desks' verdicts above.",
+        }
+
+    return verdicts
+
 
 def evaluate_earnings_gamma_squeeze(
     spot: float,
@@ -337,6 +460,10 @@ def evaluate_earnings_gamma_squeeze(
             "gsi_bear_exit": "Cover at Major Put Wall or exit at T3 Close",
             "vrp_harvest_entry": "GSI+ < 40 and GSI- < 40 -> Sell ATM strangles at T0 Close, buy back at T1 Open",
         },
+        # NOTE: `council_interrogation_outcomes` is filled in below, AFTER
+        # `forced_dealer_payload` is built (a few sections further down in this
+        # function) -- the named-member verdicts need its `invariant_ok` value,
+        # which does not exist yet at this point in the function's execution.
         "council_interrogation_outcomes": {
             "high_earning_trader": {
                 "allocation_tested": 10000000,
@@ -423,8 +550,16 @@ def evaluate_earnings_gamma_squeeze(
     forced_dealer_payload = {
         "dealer_shares_to_buy": dealer_shares,
         "dealer_dollar_demand": dealer_dollar,
+        # The dollar figure above is `shares_demand * S_new`, i.e. priced at the
+        # scenario's POST-jump spot (S_new = spot * (1 + dealer_hedging_scenario_pct
+        # / 100)), not at the report's headline current spot price -- surfaced
+        # explicitly so the rendering layer can label it correctly instead of
+        # implying it was computed at current spot.
+        "dealer_hedging_scenario_pct": 10.0,
         "pct_adtv_demand": pct_adtv,
         "dealer_hedging_velocity": dealer_velocity,
+        "invariant_ok": bool(bull_scen.get("invariant_ok", True)),
+        "max_physical_shares_demand": float(bull_scen.get("max_physical_shares_demand", 0.0)),
         "scenarios": hedging_scenarios,
     }
     # Preserve scenario float keys for backward compatibility
@@ -445,6 +580,29 @@ def evaluate_earnings_gamma_squeeze(
     # Ensure residual_gsi exists in factor_ortho_payload
     if "residual_gsi" not in factor_ortho_payload:
         factor_ortho_payload["residual_gsi"] = round(float(gsi_ortho - gsi_pos), 2) if abs(gsi_ortho - gsi_pos) > 0.01 else round(float(gsi_ortho), 2)
+
+    # Named-member council verdicts are each derived from a real, specific check
+    # against that member's stated audit focus -- not a fixed default. Prior to
+    # this, the report's rendered council section (see
+    # visualize_stock_analysis.py::build_backtesting_protocol_card_html) looked up
+    # member keys (dr_vance, marcus_reynolds, ...) that did not exist anywhere in
+    # this payload (only the five legacy keys above did), so every member's
+    # verdict/notes silently fell through to the render-side hardcoded "APPROVED" /
+    # "Quantitative standards validated." defaults regardless of the underlying
+    # numbers -- structurally incapable of ever flagging a real violation,
+    # including the ones this same audit found elsewhere in this report.
+    backtesting_protocol_payload["council_interrogation_outcomes"].update(
+        _build_council_verdicts(
+            is_actionable=is_actionable,
+            guard_result=guard_result,
+            forced_dealer_payload=forced_dealer_payload,
+            impact_meta=impact_meta,
+            bounds_bull=bounds_bull,
+            factor_ortho_payload=factor_ortho_payload,
+            borrow_meta=borrow_meta,
+            sue_score=sue_score,
+        )
+    )
 
     return {
         "is_actionable": is_actionable,

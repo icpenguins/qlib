@@ -26,6 +26,28 @@ It executes an automated machine learning workflow:
 | **Cross-Sectional Scores** | `output/scores/alpha158_russell1000_latest.parquet`<br>and `.csv` | Pre-computed daily scores, ranks, and percentiles for all Russell 1000 stocks. |
 | **MLflow Experiment** | `mlruns/<exp_id>/<run_id>/artifacts/` | Detailed training traces, loss curves, and evaluation tables. |
 
+## 2.1 Cross-Sectional Rank/Percentile Consistency (2026-09-05 fix)
+
+The model's score distribution is degenerate on many dates (e.g. only 232 distinct
+score values across 908 Russell 1000 names on 2026-09-04, with ties up to 120-wide
+-- see [audit_dataset_segments.md](audit_dataset_segments.md)'s sibling doc
+[20260905-finance_team_review_alpha158_degenerate_score.md](20260905-finance_team_review_alpha158_degenerate_score.md)
+for the root cause of the degeneracy itself). `rank` is computed with
+`.rank(ascending=False, method="min")` (standard competition ranking), **not**
+`method="dense"`. With this much tie-degeneracy, `"dense"` ranks *distinct score
+values* rather than *cross-sectional position* -- it silently stops meaning "Nth
+best of the universe" and starts meaning "Nth distinct value", which can diverge
+enormously from `percentile` (computed independently via `.rank(pct=True)`, which
+correctly divides by the full universe size regardless of ties). An adversarial
+audit of a report using the old `"dense"` rank caught exactly this: FIX showed
+"Rank 179 of 908" (implying ~80th percentile) alongside a stored `percentile` of
+51.8% for the same row -- a rank/percentile pair that cannot both be right for the
+same score. `method="min"` keeps `rank` consistent with `percentile` (small
+residual differences remain expected and legitimate: `min` assigns a tied group
+its best rank, while `percentile`'s default tie-handling averages within the tied
+group -- these are two standard, differently-defined ranking conventions, not a
+bug against each other).
+
 ## 3. Usage & CLI Options
 ```bash
 # Standard training using default US Russell 1000 workflow:

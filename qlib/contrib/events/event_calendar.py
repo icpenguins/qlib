@@ -137,6 +137,23 @@ class EventCalendarEngine:
         return last_ev, days_ago
 
     @staticmethod
+    def _describe_single_event(proximity: str, days: Optional[int], event_label: str) -> str:
+        """
+        Per-event status description, used where a card is specific to one event
+        (e.g. "Corporate Earnings") rather than the composite nearest-of-any-event
+        threat level. Unlike the composite `status_description`, this never
+        describes a *different* event than the one the card headlines.
+        """
+        if proximity == EventProximity.CRITICAL_EVENT:
+            return f"CRITICAL: {event_label} within 48H. High binary gap risk. Freeze new position entries."
+        elif proximity == EventProximity.IMMINENT_DEGROSS:
+            return f"IMMINENT: {event_label} in {days} days. 50% de-grossing active."
+        elif proximity == EventProximity.APPROACHING:
+            return f"APPROACHING: {event_label} in {days} days. Monitor implied volatility."
+        else:
+            return f"SAFE: No imminent {event_label} risk within 10 days."
+
+    @staticmethod
     def classify_proximity(trading_days: Optional[int]) -> str:
         """
         Classify proximity into standardized institutional threat levels.
@@ -205,10 +222,23 @@ class EventCalendarEngine:
             status_desc = "SAFE: No imminent binary corporate or macroeconomic catalysts within 10 days."
             badge_class = "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
 
+        # Whichever of FOMC/CPI is the more severe macro threat, for the macro-only card.
+        macro_prox = fomc_prox if threat_rank[fomc_prox] >= threat_rank[cpi_prox] else cpi_prox
+        macro_days = fomc_days if threat_rank[fomc_prox] >= threat_rank[cpi_prox] else cpi_days
+        macro_label = "FOMC Rate Decision" if threat_rank[fomc_prox] >= threat_rank[cpi_prox] else "CPI Release"
+
         return {
             "symbol": symbol.upper(),
             "current_date": curr_str,
             "composite_proximity": composite_proximity,
+            # Alias so consumers reading `status_code` (e.g.
+            # scripts/stock_analysis_engine.py's near-term event haircut sizing,
+            # and the report's "Catalyst Proximity" card badge) get the real
+            # composite threat level instead of a KeyError-silent `.get()` default
+            # of "SAFE" -- `status_code` never existed as a key here before, so
+            # every consumer of it was silently always seeing "SAFE" regardless
+            # of the true nearest-event proximity.
+            "status_code": composite_proximity,
             "status_description": status_desc,
             "badge_class": badge_class,
             "degross_multiplier": degross_multiplier,
@@ -216,6 +246,10 @@ class EventCalendarEngine:
             "next_earnings_date": next_earn_date,
             "earnings_days_away": earn_days,
             "earnings_proximity": earn_prox,
+            "earnings_status_code": earn_prox,
+            "earnings_status_description": self._describe_single_event(
+                earn_prox, earn_days, "Corporate Earnings"
+            ),
             "prev_earnings_date": prev_earn_date,
             "prev_earnings_days_ago": prev_earn_days_ago,
             # Macro
@@ -225,5 +259,7 @@ class EventCalendarEngine:
             "next_cpi_date": next_cpi_date,
             "cpi_days_away": cpi_days,
             "cpi_proximity": cpi_prox,
+            "macro_status_code": macro_prox,
+            "macro_status_description": self._describe_single_event(macro_prox, macro_days, macro_label),
         }
 
