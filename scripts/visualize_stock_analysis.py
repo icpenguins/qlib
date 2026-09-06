@@ -59,6 +59,11 @@ from stock_analysis_data import (
     _sanitize_for_json,
 )
 
+try:
+    from scripts.verdict_taxonomy import classify_executive_verdict
+except ImportError:  # pragma: no cover - direct-script execution path
+    from verdict_taxonomy import classify_executive_verdict
+
 
 def resolve_report_path(
     symbol: str,
@@ -1232,6 +1237,27 @@ def build_buy_timing_verdict_banner_html(
     corridors = gamma.get("acceleration_corridors", {})
     clock = gamma.get("earnings_event_clock", {})
 
+    # 1-3. Canonical verdict classification.
+    # NOTE: the verdict ladder is deliberately NOT inlined here. It lives in
+    # scripts/verdict_taxonomy.py so that this single-ticker banner and the
+    # Russell 1000 cross-sectional screen can never drift apart. See
+    # .team-code/verdict_taxonomy.md.
+    verdict = classify_executive_verdict(pred, gamma)
+
+    is_spike = verdict.is_spike
+    is_synthetic = verdict.is_synthetic
+    is_capital_preservation = verdict.is_capital_preservation
+
+    verdict_badge = verdict.badge
+    verdict_pill_class = verdict.pill_class
+    verdict_color = verdict.color_class
+    verdict_icon = verdict.icon
+    verdict_desc = verdict.description
+
+    rec = pred.get("recommendation", "HOLD / CAUTIOUS BUY")
+    rec_upper = str(rec).upper()
+
+    # Presentation-only values still needed by the spike callout below.
     prob_val = calib.get("calibrated_prob_squeeze")
     if prob_val is None:
         p_raw = calib.get("p_positive_squeeze")
@@ -1240,84 +1266,7 @@ def build_buy_timing_verdict_banner_html(
         else:
             prob_val = calib.get("probability_positive_spike", 0.0)
     prob_spike = float(prob_val)
-
-    gsi_pos = float(
-        gsi.get("gsi_positive")
-        if gsi.get("gsi_positive") is not None
-        else gsi.get("gsi_positive_raw", 0.0)
-    )
     exp_jump = float(vol_surf.get("expected_jump_pct", 0.0))
-    is_pos_candidate = bool(
-        gsi.get("is_positive_squeeze_candidate", False)
-        or gsi.get("is_positive_alert", False)
-        or (gsi_pos >= 60.0)
-    )
-    is_spike = (prob_spike >= 60.0 or gsi_pos >= 60.0 or exp_jump >= 5.0) and is_pos_candidate
-
-    # 2. Check safety / provenance
-    is_synthetic = (
-        gamma.get("provenance") == "synthetic_research_fallback"
-        or gamma.get("safety_status") == "ACTION_SUPPRESSED"
-        or not gamma.get("is_actionable", True)
-    )
-
-    # 3. Determine Execution Posture & Capital Preservation Invariant
-    rec = pred.get("recommendation", "HOLD / CAUTIOUS BUY")
-    rec_upper = str(rec).upper()
-    is_capital_preservation = (
-        pred.get("is_capital_preservation", False)
-        or not pred.get("is_entry_allowed", True)
-        or "DO NOT BUY" in rec_upper
-        or "CAPITAL PRESERVATION" in rec_upper
-        or "RISK-OFF" in rec_upper
-        or "REGIME SHIFT" in rec_upper
-        or "PAUSE" in rec_upper
-        or "EVENT RISK" in rec_upper
-        or pred.get("bocd_regime_state") == 2
-    )
-
-    if is_capital_preservation:
-        verdict_badge = "🔴 DO NOT BUY / CAPITAL PRESERVATION MODE"
-        verdict_pill_class = "bg-rose-500/15 text-rose-400 border-rose-500/30"
-        verdict_color = "text-rose-400"
-        verdict_icon = "▼"
-        verdict_desc = "Unfavorable technical structure, negative gamma trap, or macroeconomic regime stress. Maintain capital preservation and inhibit all buy entries."
-    elif is_spike and not is_synthetic:
-        verdict_badge = "⚡ IMMEDIATE BUY: HIGH-VELOCITY 5-DAY SPIKE DETECTED"
-        verdict_pill_class = "bg-emerald-500/20 text-emerald-300 border-emerald-500/50 glow-green"
-        verdict_color = "text-emerald-400"
-        verdict_icon = "⚡"
-        verdict_desc = "High-conviction convex gamma expansion triggered. Dealer hedging demand expected to accelerate spot price above trigger strike over the next 5 trading days."
-    elif is_spike and is_synthetic:
-        verdict_badge = "⚡ RESEARCH SPIKE PATTERN (ACTION SUPPRESSED: SYNTHETIC DATA)"
-        verdict_pill_class = "bg-amber-500/20 text-amber-300 border-amber-500/50"
-        verdict_color = "text-amber-400"
-        verdict_icon = "⚠️"
-        verdict_desc = "Theoretical 5-day gamma spike modeled on synthetic fallback. Action suppressed until real-time options chain and live borrow data verify."
-    elif "STRONG BUY" in rec_upper or "ACCUMULATE" in rec_upper:
-        verdict_badge = "🟢 STRONG BUY: STRATEGIC MULTI-HORIZON ACCUMULATION"
-        verdict_pill_class = "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
-        verdict_color = "text-emerald-400"
-        verdict_icon = "▲"
-        verdict_desc = "Favorable multi-horizon risk-reward profile backed by positive drift, institutional AVWAP support, and low changepoint hazard."
-    elif "PULLBACK" in rec_upper:
-        verdict_badge = "🔵 BUY ON PULLBACK: WAIT FOR ENTRY CORRIDOR"
-        verdict_pill_class = "bg-blue-500/15 text-blue-400 border-blue-500/30"
-        verdict_color = "text-blue-400"
-        verdict_icon = "⏳"
-        verdict_desc = "Stock is currently extended above near-term value. Place limit orders inside the optimal entry corridor to capture favorable asymmetry."
-    elif "HOLD" in rec_upper:
-        verdict_badge = "🟡 HOLD / CAUTIOUS BUY: IMMINENT CATALYST & REGIME HAZARD"
-        verdict_pill_class = "bg-amber-500/15 text-amber-400 border-amber-500/30"
-        verdict_color = "text-amber-400"
-        verdict_icon = "◼"
-        verdict_desc = "Approaching binary earnings announcement or elevated changepoint hazard. Enforce position haircuts until catalyst resolution."
-    else:
-        verdict_badge = "🔴 DO NOT BUY / CAPITAL PRESERVATION MODE"
-        verdict_pill_class = "bg-rose-500/15 text-rose-400 border-rose-500/30"
-        verdict_color = "text-rose-400"
-        verdict_icon = "▼"
-        verdict_desc = "Unfavorable technical structure, negative gamma trap, or macroeconomic regime stress. Maintain capital preservation."
 
     # 4. Extract Timing & Pricing
     entry_range = pred.get("optimal_entry_range", [spot_price * 0.98, spot_price * 1.02])

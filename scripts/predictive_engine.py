@@ -414,6 +414,17 @@ class RecommendationEngine:
                 f"Institutional underreaction provides positive drift momentum.]"
             )
 
+        # Entry corridor ordering invariant.
+        # Several branches build the corridor from two independently-derived
+        # bounds -- e.g. the BOCD State-0 branches use
+        #   entry_low  = max(key_support, current_price * 0.96)
+        #   entry_high = current_price * 0.985
+        # which invert whenever key_support exceeds 0.985 * spot (observed on
+        # AES and SLAB in the 2026-09-04 Russell 1000 cross-section, producing
+        # a nonsensical "$217.38 - $217.27" corridor). Ordering the pair is a
+        # no-op for every well-formed corridor and cannot change a valid result.
+        entry_low, entry_high = min(entry_low, entry_high), max(entry_low, entry_high)
+
         return recommendation, action_summary, float(entry_low), float(entry_high), opt_window_start, opt_window_end
 
 
