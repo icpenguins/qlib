@@ -886,11 +886,17 @@ def build_events_card_html(events: Optional[Dict[str, Any]]) -> str:
     )
 
     # PEAD info
+    # NOTE: PEADEngine.evaluate_recent_pead (qlib/contrib/events/pead.py) returns
+    # the report date as `latest_report_date`, not `recent_announcement_date` --
+    # that key never existed, so this line always rendered "Reported on N/A."
+    # regardless of whether a real earnings date was available (it was -- Gap and
+    # Drift below are anchored to it correctly; only the caption's own date lookup
+    # was broken).
     pead_regime = pead_info.get("drift_regime", "NEUTRAL")
     sue = pead_info.get("sue_score", 0.0)
     gap_pct = pead_info.get("announcement_gap_pct", 0.0)
     drift_pct = pead_info.get("post_earnings_drift_pct", 0.0)
-    recent_earn_date = pead_info.get("recent_announcement_date", "N/A")
+    recent_earn_date = pead_info.get("latest_report_date", "N/A")
 
     if "bullish" in pead_regime.lower():
         pead_badge = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
@@ -1590,7 +1596,13 @@ def build_gamma_squeeze_spike_card_html(
     liq_regime = liq.get("liquidity_regime", "Normal")
 
     post_iv = vol_surf.get("post_earnings_iv", 0.0)
-    crush_ratio = vol_surf.get("historical_crush_ratio", 0.0)
+    # NOTE: real key is `volatility_crush_ratio` (see
+    # qlib/contrib/derivatives/post_earnings_volatility.py) -- "historical_crush_ratio"
+    # never existed, so the "Winsorized IV Crush" stat always showed -0.0%
+    # regardless of the real computed crush. `crush_source` also never existed,
+    # but its default ("winsorized_median") is a static description of a fixed
+    # methodology, not a per-ticker value, so it is harmless left as a default.
+    crush_ratio = vol_surf.get("volatility_crush_ratio", 0.0)
     crush_src = vol_surf.get("crush_source", "winsorized_median")
 
     res_gsi = float(
@@ -1599,7 +1611,17 @@ def build_gamma_squeeze_spike_card_html(
         else factor_ortho.get("gsi_orthogonal", 0.0)
     )
 
-    t0_time = clock.get("t0_timestamp", "Post-Close AMC")
+    # NOTE: real key is `announcement_timestamp` (see
+    # resolve_earnings_event_execution / EarningsEventClock) -- "t0_timestamp"
+    # never existed, so this always showed the generic "Post-Close AMC" default
+    # instead of the actual computed announcement time. `execution_window`,
+    # `t1_open_action`, and `t5_exit_action` below (in the non-suppressed
+    # branches) are left on their defaults deliberately: EarningsEventClock
+    # computes signal/announcement/execution *timestamps*, not a formatted
+    # window string or prose action descriptions, so there is no real per-
+    # ticker value to substitute for those three -- the defaults are static,
+    # correct procedural guidance text, not a stand-in for missing data.
+    t0_time = clock.get("announcement_timestamp", "Post-Close AMC")
 
     if is_cap_pres:
         exec_window = "SUSPENDED &mdash; CAPITAL PRESERVATION"
@@ -1807,46 +1829,48 @@ def build_gamma_squeeze_spike_card_html(
 def build_multi_horizon_matrix_card_html(eval_matrix: Optional[Dict[str, Any]]) -> str:
     """
     Construct modular HTML container for the Multi-Horizon Conviction Matrix (t+1 to t+5 through 10Y).
+
+    NOTE (fixed 2026-09-06): the horizon keys this function looked up
+    ("t_plus_1_to_5", "1M", "6M", "1Y", "3Y", "10Y") did not match ANY of the
+    real keys `evaluation_matrix_payload` (earnings_gamma_squeeze_engine.py)
+    actually uses ("t_plus_1_to_t_plus_5", "1_month", "6_month", "1_year",
+    "3_year", "10_year") -- `eval_matrix.get(key)` returned None for every
+    single horizon, so `if not data: continue` fired every time and this
+    entire table rendered zero rows on every report ever generated (the card
+    itself still appeared, empty, since `eval_matrix` was truthy).
+    Additionally, the fields this function tried to read per horizon
+    (direction/conviction_score/expected_return_pct/sharpe_ratio/
+    primary_driver/optimal_action) were never computed anywhere -- the real
+    payload is a qualitative evaluation brief per horizon
+    (evaluating_agents/focus/min_probability_threshold/target_output), not a
+    quantitative forecast. Rather than fabricate a per-horizon direction/
+    conviction/Sharpe number with no real model behind it, the columns below
+    were changed to show the real fields.
     """
     if not eval_matrix:
         return ""
 
     horizon_labels = [
-        ("t_plus_1_to_5", "Next-Day to Next-Week (5 Trading Days)", "Tactical Gamma Squeeze / Earnings Spike"),
-        ("1M", "1 Month (21 Trading Days)", "Post-Earnings Announcement Drift (PEAD)"),
-        ("6M", "6 Months (126 Trading Days)", "Cyclical Momentum & Value Area Mean-Reversion"),
-        ("1Y", "1 Year (252 Trading Days)", "Fundamental Compound Growth & Factor Beta"),
-        ("3Y", "3 Years (756 Trading Days)", "Structural Trend & Macro Regime Transitions"),
-        ("10Y", "10 Years (2520 Trading Days)", "Secular Compound Returns & Moat Durability"),
+        ("t_plus_1_to_t_plus_5", "Next-Day to Next-Week (5 Trading Days)"),
+        ("1_month", "1 Month (21 Trading Days)"),
+        ("6_month", "6 Months (126 Trading Days)"),
+        ("1_year", "1 Year (252 Trading Days)"),
+        ("3_year", "3 Years (756 Trading Days)"),
+        ("10_year", "10 Years (2520 Trading Days)"),
     ]
 
     rows_html = ""
-    for key, label, subtitle in horizon_labels:
+    for key, label in horizon_labels:
         data = eval_matrix.get(key)
         if not data:
             continue
 
-        direction = data.get("direction", "NEUTRAL").upper()
-        conviction = float(data.get("conviction_score", 50.0))
-        ret_pct = float(data.get("expected_return_pct", 0.0))
-        sharpe = float(data.get("sharpe_ratio", 1.0))
-        driver = data.get("primary_driver", "N/A")
-        action = data.get("optimal_action", "Hold")
+        agents = data.get("evaluating_agents", "N/A")
+        focus = data.get("focus", "N/A")
+        threshold_pct = float(data.get("min_probability_threshold", 0.0)) * 100.0
+        target_output = data.get("target_output", "N/A")
 
-        if "BULL" in direction or "BUY" in direction or "ACCUMULATE" in direction:
-            dir_badge = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
-            bar_color = "bg-emerald-500"
-            ret_color = "text-emerald-400"
-        elif "BEAR" in direction or "SELL" in direction:
-            dir_badge = "bg-rose-500/10 text-rose-400 border-rose-500/30"
-            bar_color = "bg-rose-500"
-            ret_color = "text-rose-400"
-        else:
-            dir_badge = "bg-gray-800 text-gray-400 border-gray-700"
-            bar_color = "bg-blue-500"
-            ret_color = "text-gray-300"
-
-        is_5d = (key == "t_plus_1_to_5")
+        is_5d = (key == "t_plus_1_to_t_plus_5")
         row_highlight = "bg-emerald-950/20 border-l-2 border-emerald-500" if is_5d else "hover:bg-gray-800/30"
 
         rows_html += f"""
@@ -1856,30 +1880,16 @@ def build_multi_horizon_matrix_card_html(eval_matrix: Optional[Dict[str, Any]]) 
               <span>{label}</span>
               {f'''<span class="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-emerald-950/80 text-emerald-300 border-emerald-500/60 glow-green">5-DAY RADAR</span>''' if is_5d else ''}
             </div>
-            <div class="text-[10px] text-gray-400 font-sans">{subtitle}</div>
-          </td>
-          <td class="py-2.5 px-3">
-            <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {dir_badge}">{direction}</span>
-          </td>
-          <td class="py-2.5 px-3">
-            <div class="flex items-center gap-2">
-              <div class="w-20 bg-gray-800 rounded-full h-1.5 overflow-hidden">
-                <div class="{bar_color} h-full rounded-full" style="width: {conviction:.0f}%"></div>
-              </div>
-              <span class="text-white font-bold">{conviction:.0f}%</span>
-            </div>
-          </td>
-          <td class="py-2.5 px-3 text-right font-bold {ret_color}">
-            {'+' if ret_pct >= 0 else ''}{ret_pct:.1f}%
-          </td>
-          <td class="py-2.5 px-3 text-right text-gray-300">
-            {sharpe:.2f}
+            <div class="text-[10px] text-gray-400 font-sans">{focus}</div>
           </td>
           <td class="py-2.5 px-3 text-gray-300 text-[11px] font-sans">
-            {driver}
+            {agents}
           </td>
-          <td class="py-2.5 px-3 text-white font-medium text-[11px] font-sans">
-            {action}
+          <td class="py-2.5 px-3 text-right text-white font-bold">
+            {threshold_pct:.0f}%
+          </td>
+          <td class="py-2.5 px-3 text-gray-300 text-[11px] font-sans">
+            {target_output}
           </td>
         </tr>
         """
@@ -1905,12 +1915,9 @@ def build_multi_horizon_matrix_card_html(eval_matrix: Optional[Dict[str, Any]]) 
           <thead>
             <tr class="border-b border-gray-800 text-[10px] text-gray-400 font-mono bg-gray-950/50">
               <th class="py-2 px-3">INVESTMENT HORIZON</th>
-              <th class="py-2 px-3">DIRECTION</th>
-              <th class="py-2 px-3">CONVICTION</th>
-              <th class="py-2 px-3 text-right">EXPECTED RETURN</th>
-              <th class="py-2 px-3 text-right">SHARPE</th>
-              <th class="py-2 px-3">PRIMARY QUANTITATIVE DRIVER</th>
-              <th class="py-2 px-3">OPTIMAL ACTION</th>
+              <th class="py-2 px-3">EVALUATING AGENTS</th>
+              <th class="py-2 px-3 text-right">MIN PROBABILITY THRESHOLD</th>
+              <th class="py-2 px-3">TARGET OUTPUT</th>
             </tr>
           </thead>
           <tbody>
@@ -1953,10 +1960,14 @@ def build_backtesting_protocol_card_html(backtest: Optional[Dict[str, Any]]) -> 
     dsr_status = "STATISTICALLY SIGNIFICANT (p < 0.05)" if is_sig else "INCONCLUSIVE SAMPLE DEPTH"
 
     # Panel metrics
+    # NOTE: `cagr_pct` was previously read here but the real
+    # verifiable_replication_event_panel payload has never had that key (it has
+    # avg_trade_jump_pct instead) -- the variable was also never referenced in
+    # this function's rendered HTML, so it was dead code reading a dead key.
+    # Removed rather than "fixed" since there was nothing on screen to correct.
     n_events = int(panel.get("n_events", 0))
     win_rate = float(panel.get("win_rate", 0.0))
     profit_factor = float(panel.get("profit_factor", 0.0))
-    cagr_pct = float(panel.get("cagr_pct", 0.0))
     max_dd = float(panel.get("max_drawdown_pct", 0.0))
 
     # Purged CV metrics.
@@ -1980,10 +1991,16 @@ def build_backtesting_protocol_card_html(backtest: Optional[Dict[str, Any]]) -> 
     perm_bps = float(impact.get("permanent_impact_bps", 0.0))
     tot_slip = float(impact.get("total_cost_bps", 0.0))
 
-    # Borrow metrics
-    borrow_fee = float(borrow.get("borrow_fee_bps", 0.0))
+    # Borrow metrics.
+    # NOTE: the real key is `annual_borrow_rate` (a fraction, e.g. 0.005 for 50
+    # bps general collateral -- see qlib/contrib/backtest/borrow_fee_engine.py),
+    # not `borrow_fee_bps`, which never existed and always defaulted to 0.0.
+    # `utilization_pct` ("Lendable Utilization") also never existed anywhere in
+    # this pipeline -- there is no per-security securities-lending utilization
+    # computed by this fork, so rather than display a fabricated 0.0% next to
+    # real numbers, that stat is removed below (see the HTML for this card).
+    borrow_fee = float(borrow.get("annual_borrow_rate", 0.0)) * 10000.0
     is_htb = bool(borrow.get("is_hard_to_borrow", False))
-    util_pct = float(borrow.get("utilization_pct", 0.0))
 
     # Council members breakdown
     members = [
@@ -2152,8 +2169,8 @@ def build_backtesting_protocol_card_html(backtest: Optional[Dict[str, Any]]) -> 
                 <span class="{'text-rose-400 font-bold' if is_htb else 'text-emerald-400'}">{'YES' if is_htb else 'NO'}</span>
               </div>
               <div class="flex justify-between text-gray-400">
-                <span>Lendable Utilization:</span>
-                <span class="text-white">{util_pct:.1f}%</span>
+                <span>Locate Granted:</span>
+                <span class="{'text-emerald-400 font-bold' if borrow.get('locate_granted', True) else 'text-rose-400 font-bold'}">{'YES' if borrow.get('locate_granted', True) else 'NO -- TRADE REJECTED'}</span>
               </div>
               <div class="flex justify-between text-gray-400">
                 <span>Short Squeeze Vulnerability:</span>

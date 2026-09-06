@@ -232,7 +232,12 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
                     "expected_jump_pct": 8.5,
                     "event_variance": 0.0072,
                     "post_earnings_iv": 0.35,
-                    "historical_crush_ratio": 0.42,
+                    # Real key is `volatility_crush_ratio` (see
+                    # qlib/contrib/derivatives/post_earnings_volatility.py) --
+                    # this mock previously used "historical_crush_ratio", which
+                    # never existed in the real producer.
+                    "volatility_crush_pct": 42.0,
+                    "volatility_crush_ratio": 0.42,
                     "crush_source": "winsorized_median",
                     "min_samples_threshold": 4,
                 },
@@ -266,8 +271,20 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
                     "confidence_band": [78.2, 89.6],
                 },
                 "earnings_event_clock": {
-                    "t0_timestamp": "2025-10-31 16:05:00 AMC",
-                    "t1_timestamp": "2025-11-03 09:30:00 OPEN",
+                    # Real keys per resolve_earnings_event_execution / EarningsEventClock
+                    # (qlib/contrib/events/earnings_event_clock.py) -- this mock
+                    # previously used "t0_timestamp"/"t1_timestamp", which never
+                    # existed in the real producer. `t1_open_action`/`t5_exit_action`/
+                    # `execution_window` genuinely don't exist either (see
+                    # ALLOWED_EXTRA_KEYS in tests/test_visualize_key_contracts.py) --
+                    # kept here only because the render side's static fallback text
+                    # is intentional, not because a producer emits them.
+                    "reporting_time": "AMC",
+                    "signal_timestamp": "2025-10-31 09:30:00",
+                    "announcement_timestamp": "2025-10-31 16:05:00 AMC",
+                    "execution_timestamp": "2025-11-03 09:30:00 OPEN",
+                    "execution_fill_type": "T1_OPEN",
+                    "is_compliant": True,
                     "t1_open_action": "Execute limit buy in optimal corridor",
                     "t5_exit_action": "De-gross into Upper Squeeze Wall",
                     "execution_window": "Immediate T+1 Open through T+5 Close",
@@ -285,27 +302,45 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
             },
             "backtesting_protocol": {
                 "purged_walk_forward_cv": {
-                    "train_folds": 5,
-                    "test_folds": 5,
+                    # Real payload only ever has a single expanding-window fold
+                    # count (`n_folds`) plus per-fold window lengths -- this
+                    # mock previously used "train_folds"/"test_folds", which
+                    # never existed in the real producer.
+                    "n_folds": 7,
+                    "train_window_days": 756,
+                    "test_window_days": 252,
                     "embargo_days": 10,
                     "is_purged": True,
                 },
                 "almgren_chriss_market_impact": {
-                    "temp_impact_bps": 14.5,
-                    "perm_impact_bps": 10.0,
+                    # Real keys per calculate_market_impact (see
+                    # qlib/contrib/microstructure/almgren_chriss_impact.py) --
+                    # this mock previously used temp_impact_bps/perm_impact_bps/
+                    # total_slippage_bps, none of which the real function returns.
+                    "temporary_impact_bps": 14.5,
+                    "permanent_impact_bps": 10.0,
                     "half_life_decay": 0.5,
-                    "total_slippage_bps": 24.5,
+                    "total_cost_bps": 24.5,
                 },
                 "borrow_fee_engine": {
-                    "borrow_fee_bps": 65.0,
+                    # Real key is `annual_borrow_rate` (a fraction) per
+                    # calculate_borrow_cost -- this mock previously used
+                    # "borrow_fee_bps" (never existed) and "utilization_pct"
+                    # (no such concept is computed anywhere in this pipeline).
+                    "annual_borrow_rate": 0.0065,
                     "is_hard_to_borrow": False,
-                    "utilization_pct": 34.5,
+                    "locate_granted": True,
                     "annualized_cost": 0.65,
                 },
                 "deflated_sharpe_ratio": {
                     "best_sharpe": 1.85,
                     "expected_max_sharpe_hurdle": 1.30,
-                    "dsr_probability": 96.2,
+                    # Real key stores a FRACTION in [0, 1] (see
+                    # qlib/contrib/backtest/deflated_sharpe_ratio.py) -- this
+                    # mock previously used 96.2 (already a percentage), which
+                    # would have hidden the missing `* 100.0` scaling bug fixed
+                    # 2026-09-05 instead of catching it.
+                    "dsr_probability": 0.962,
                     "n_trials": 240,
                     "is_statistically_significant": True,
                 },
@@ -313,7 +348,7 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
                     "n_events": 128,
                     "win_rate": 0.688,
                     "profit_factor": 2.45,
-                    "cagr_pct": 28.5,
+                    "avg_trade_jump_pct": 8.4,
                     "max_drawdown_pct": -9.8,
                     "calmar_ratio": 2.91,
                 },
@@ -332,60 +367,57 @@ class TestVisualizeStockAnalysisRefactor(unittest.TestCase):
                     "arthur_pendelton": {"verdict": "APPROVED", "notes": "Capital allocation approved with strict stop-loss peg."},
                 },
             },
+            # NOTE (2026-09-06): keys/fields below match the REAL
+            # evaluation_matrix_payload schema emitted by
+            # earnings_gamma_squeeze_engine.py::evaluate_earnings_gamma_squeeze.
+            # The previous mock here used "t_plus_1_to_5"/"1M"/"6M"/... keys and
+            # direction/conviction_score/expected_return_pct/sharpe_ratio/
+            # primary_driver/optimal_action fields -- none of which the real
+            # producer ever emits (real keys are "t_plus_1_to_t_plus_5"/
+            # "1_month"/"6_month"/... with evaluating_agents/focus/
+            # min_probability_threshold/target_output). That mismatch is
+            # exactly why this mock never caught
+            # build_multi_horizon_matrix_card_html rendering zero rows on
+            # every real report -- the mock had drifted to match the bug
+            # instead of reality. See tests/test_visualize_key_contracts.py
+            # for the regression test that now guards against this class of
+            # drift going forward.
             "evaluation_matrix": {
-                "t_plus_1_to_5": {
-                    "direction": "BULLISH",
-                    "conviction_score": 88.0,
-                    "expected_return_pct": 8.5,
-                    "sharpe_ratio": 2.15,
-                    "primary_driver": "Convex Dealer Delta Hedging Squeeze",
-                    "optimal_action": "Aggressive Tactical Buy at T1 Open",
-                    "risk_factors": ["Overnight binary announcement gap"],
+                "t_plus_1_to_t_plus_5": {
+                    "evaluating_agents": "High-Earning Trader, Quant",
+                    "focus": "Earnings Gamma Squeeze / Liquidation Cascade",
+                    "min_probability_threshold": 0.78,
+                    "target_output": "Immediate cash velocity ($840k per $10M trade) exploiting forced dealer re-hedging",
                 },
-                "1M": {
-                    "direction": "BULLISH",
-                    "conviction_score": 78.0,
-                    "expected_return_pct": 6.2,
-                    "sharpe_ratio": 1.75,
-                    "primary_driver": "PEAD Earnings Momentum Drift",
-                    "optimal_action": "Hold through 30-day post-announcement window",
-                    "risk_factors": ["Macro CPI release volatility"],
+                "1_month": {
+                    "evaluating_agents": "High-Earning Trader, Quant",
+                    "focus": "PEAD Momentum / AVWAP Rebound",
+                    "min_probability_threshold": 0.75,
+                    "target_output": "Rapid monthly cash generation without capital lockup",
                 },
-                "6M": {
-                    "direction": "ACCUMULATE",
-                    "conviction_score": 72.0,
-                    "expected_return_pct": 14.5,
-                    "sharpe_ratio": 1.45,
-                    "primary_driver": "Volume Profile Value Area Support",
-                    "optimal_action": "Accumulate on pullbacks to YTD AVWAP",
-                    "risk_factors": ["BOCD regime transition hazard"],
+                "6_month": {
+                    "evaluating_agents": "Trader, HF Manager, Quant",
+                    "focus": "Event-driven / Trend following",
+                    "min_probability_threshold": 0.70,
+                    "target_output": "Scalable quarterly alpha via BOCD regime transitions",
                 },
-                "1Y": {
-                    "direction": "BULLISH",
-                    "conviction_score": 75.0,
-                    "expected_return_pct": 22.0,
-                    "sharpe_ratio": 1.35,
-                    "primary_driver": "Fundamental Earnings Expansion & Compound Growth",
-                    "optimal_action": "Core institutional long allocation",
-                    "risk_factors": ["Sector rotation into defensives"],
+                "1_year": {
+                    "evaluating_agents": "HF Manager, Analyst, Quant",
+                    "focus": "Macro regime capture",
+                    "min_probability_threshold": 0.80,
+                    "target_output": "Maximum risk-adjusted Annual Recurring Revenue (Sharpe > 2.0)",
                 },
-                "3Y": {
-                    "direction": "ACCUMULATE",
-                    "conviction_score": 70.0,
-                    "expected_return_pct": 58.0,
-                    "sharpe_ratio": 1.15,
-                    "primary_driver": "Structural Industry Trend & Secular Margin Expansion",
-                    "optimal_action": "Strategic cycle rebalancing",
-                    "risk_factors": ["Macroeconomic interest rate cycles"],
+                "3_year": {
+                    "evaluating_agents": "Analyst, Finance Mgr, Quant",
+                    "focus": "Fundamental compounding",
+                    "min_probability_threshold": 0.85,
+                    "target_output": "Structural market share, secular earnings growth",
                 },
-                "10Y": {
-                    "direction": "BULLISH",
-                    "conviction_score": 80.0,
-                    "expected_return_pct": 195.0,
-                    "sharpe_ratio": 1.05,
-                    "primary_driver": "Durable Competitive Moat & Secular Reinvestment Rate",
-                    "optimal_action": "Permanent compounder holding",
-                    "risk_factors": ["Technological disruption"],
+                "10_year": {
+                    "evaluating_agents": "Finance Mgr, Quant",
+                    "focus": "Capital preservation / Growth",
+                    "min_probability_threshold": 0.90,
+                    "target_output": "Legacy wealth compounding and structural tax shielding",
                 },
             },
         }
