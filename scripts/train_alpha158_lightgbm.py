@@ -20,7 +20,7 @@ import logging
 import argparse
 import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List, Set
+from typing import Dict, Any, Optional, Tuple, List, Set, cast
 
 import numpy as np
 import pandas as pd
@@ -29,7 +29,7 @@ from ruamel.yaml import YAML
 # Reconfigure stdout to UTF-8 for safe institutional console logging
 if hasattr(sys.stdout, "reconfigure"):
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace") # pyright: ignore[reportAttributeAccessIssue]
     except Exception:
         pass
 
@@ -383,6 +383,14 @@ def _slice_segment(df: pd.DataFrame, seg_range: Any) -> pd.DataFrame:
         start, end = seg_range
     else:
         start = end = seg_range
+
+    # ``segments`` may still present a single value as a len-1 list/tuple in some
+    # callers, so normalise to a scalar before constructing pandas timestamps.
+    if isinstance(start, (list, tuple)):
+        start = start[0] if start else None
+    if isinstance(end, (list, tuple)):
+        end = end[-1] if end else None
+
     lo = pd.Timestamp(start) if start is not None else None
     hi = pd.Timestamp(end) if end is not None else None
     return df.loc[lo:hi]
@@ -428,6 +436,12 @@ def audit_dataset_segments(handler_config: Dict[str, Any], segments: Dict[str, A
 
     for seg_name, seg_range in segments.items():
         try:
+            # Type narrowing: ensure DataFrame for downstream helpers
+            if isinstance(label_df, pd.Series):
+                label_df = label_df.to_frame(name=label_df.name or "label")
+            else:
+                label_df = cast(pd.DataFrame, label_df)
+
             seg_raw = _slice_segment(label_df, seg_range)
             seg_df = seg_raw.dropna(subset=label_cols) if label_cols else seg_raw
 
