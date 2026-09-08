@@ -55,3 +55,10 @@ tags
 reports/
 .venv/
 tests/test_all_flow_mlruns/
+
+# Scratch output forced by an active --num_boost_round (or future equivalent)
+# training override -- see qlib/contrib/validation/score_quality.py and
+# scripts/train_alpha158_lightgbm.py::_resolve_output_dirs. These are
+# throwaway dev-loop smoke-test artifacts, never production.
+models/lightgbm/_smoketest/
+output/scores/_smoketest/

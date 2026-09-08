@@ -30,6 +30,13 @@ from scripts.train_alpha158_lightgbm import (
     calculate_ic_metrics,
     resolve_factor_attribution,
     print_institutional_summary_banner,
+    _build_scores_df,
+    _resolve_output_dirs,
+    bless_pinned_reference,
+    PRODUCTION_MODEL_DIR,
+    PRODUCTION_SCORES_DIR,
+    SMOKETEST_MODEL_DIR,
+    SMOKETEST_SCORES_DIR,
 )
 
 
@@ -287,3 +294,84 @@ class TestLightGBMAlpha158US:
         assert "OUT-OF-SAMPLE TEST METRICS" in captured
         assert "TOP 5 ALPHA ATTRIBUTION FACTORS" in captured
         assert "PERSISTED PRODUCTION ARTIFACTS" in captured
+
+    # -----------------------------------------------------------------
+    # 2026-09-08 fail-closed / promotion-restructure regression coverage
+    # (implementation plan Part 3.3 P1 / 3.7 steps 1-3)
+    # -----------------------------------------------------------------
+
+    def test_calculate_ic_metrics_raises_on_empty_merge(self):
+        """3.3 P1 fail-closed fix: an empty pred/label merge must raise, never return all-zeros."""
+        dates = pd.date_range("2025-01-01", periods=5, freq="B")
+        idx = pd.MultiIndex.from_product([dates, ["AAPL"]], names=["datetime", "instrument"])
+        pred_df = pd.DataFrame({"score": [np.nan] * 5}, index=idx)
+        label_df = pd.DataFrame({"label": [1.0, 2.0, 3.0, 4.0, 5.0]}, index=idx)
+
+        with pytest.raises(ValueError, match="0 rows after dropna"):
+            calculate_ic_metrics(pred_df, label_df)
+
+    def test_calculate_ic_metrics_raises_on_none_inputs(self):
+        with pytest.raises(ValueError):
+            calculate_ic_metrics(None, None)
+
+    def test_build_scores_df_raises_on_none(self):
+        with pytest.raises(ValueError, match="pred_df is None"):
+            _build_scores_df(None)
+
+    def test_build_scores_df_raises_on_empty(self):
+        empty = pd.DataFrame({"score": []}, index=pd.MultiIndex.from_arrays([[], []], names=["datetime", "instrument"]))
+        with pytest.raises(ValueError, match="empty"):
+            _build_scores_df(empty)
+
+    def test_build_scores_df_produces_expected_columns_and_min_rank(self):
+        dates = pd.date_range("2025-01-01", periods=2, freq="B")
+        idx = pd.MultiIndex.from_product([dates, ["AAPL", "MSFT", "NVDA"]], names=["datetime", "instrument"])
+        pred_df = pd.DataFrame({"score": [0.5, 0.9, 0.1, 0.3, 0.3, 0.7]}, index=idx)
+
+        scores_df = _build_scores_df(pred_df)
+
+        assert list(scores_df.columns) == ["date", "symbol", "score", "rank", "percentile"]
+        # Highest score on the first date (MSFT, 0.9) must be rank 1.
+        first_date = scores_df["date"].min()
+        top_row = scores_df[scores_df["date"] == first_date].sort_values("score", ascending=False).iloc[0]
+        assert top_row["rank"] == 1
+        assert top_row["symbol"] == "MSFT"
+
+    def test_resolve_output_dirs_override_forces_smoketest_ignoring_caller_dirs(self, tmp_path):
+        """3.3 P0 / 3.7 step 3: an active override must win even if a caller passes explicit production-like dirs."""
+        caller_model_dir = tmp_path / "models" / "lightgbm"
+        caller_scores_dir = tmp_path / "output" / "scores"
+
+        model_dir, scores_dir = _resolve_output_dirs(True, caller_model_dir, caller_scores_dir)
+
+        assert model_dir == SMOKETEST_MODEL_DIR
+        assert scores_dir == SMOKETEST_SCORES_DIR
+        assert model_dir != caller_model_dir
+        assert scores_dir != caller_scores_dir
+
+    def test_resolve_output_dirs_no_override_uses_production_defaults(self):
+        model_dir, scores_dir = _resolve_output_dirs(False, None, None)
+        assert model_dir == PRODUCTION_MODEL_DIR
+        assert scores_dir == PRODUCTION_SCORES_DIR
+
+    def test_resolve_output_dirs_no_override_respects_caller_dirs(self, tmp_path):
+        caller_model_dir = tmp_path / "custom_models"
+        caller_scores_dir = tmp_path / "custom_scores"
+        model_dir, scores_dir = _resolve_output_dirs(False, caller_model_dir, caller_scores_dir)
+        assert model_dir == caller_model_dir
+        assert scores_dir == caller_scores_dir
+
+    def test_bless_pinned_reference_refuses_missing_scores_file(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            bless_pinned_reference(scores_parquet_path=tmp_path / "does_not_exist.parquet", meta_path=tmp_path / "meta.json")
+
+    def test_bless_pinned_reference_refuses_failing_gate(self, tmp_path):
+        import json as _json
+
+        scores_path = tmp_path / "scores.parquet"
+        pd.DataFrame({"date": ["2025-01-01"], "symbol": ["AAPL"], "score": [0.1]}).to_parquet(scores_path, index=False)
+        meta_path = tmp_path / "meta.json"
+        meta_path.write_text(_json.dumps({"recorder_id": "abc", "quality_gate": {"passed": False, "failures": ["x"]}}), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="does not record a passing quality_gate"):
+            bless_pinned_reference(scores_parquet_path=scores_path, meta_path=meta_path)

@@ -16,9 +16,13 @@ import os
 import sys
 import json
 import time
+import uuid
+import pickle
+import hashlib
 import logging
 import argparse
 import datetime
+import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List, Set, cast
 
@@ -52,6 +56,26 @@ from qlib.utils import init_instance_by_config
 from qlib.workflow import R
 from qlib.model.trainer import task_train
 from qlib.data.dataset.utils import convert_index_format
+from qlib.contrib.validation.score_quality import (
+    ScoreQualityGateError,
+    validate_score_quality,
+    extract_ic_metrics,
+    extract_portfolio_metrics,
+)
+
+# Production artifact paths. These are the ONLY two locations any successful,
+# gate-passing training run may write its final model/score artifacts to. A
+# hyperparameter override (--num_boost_round today; any future equivalent)
+# is structurally forced away from these paths -- see `_resolve_output_dirs`
+# below -- closing the exact mechanism (Part 1.3.1 / 3.3 P0 of the
+# implementation plan) that let a 1-round "quick test" run silently become
+# the 2026-09-08 production incident.
+PRODUCTION_MODEL_DIR = REPO_ROOT / "models" / "lightgbm"
+PRODUCTION_SCORES_DIR = REPO_ROOT / "output" / "scores"
+SMOKETEST_MODEL_DIR = REPO_ROOT / "models" / "lightgbm" / "_smoketest"
+SMOKETEST_SCORES_DIR = REPO_ROOT / "output" / "scores" / "_smoketest"
+PINNED_REFERENCE_PATH = REPO_ROOT / "models" / "lightgbm" / "pinned_reference" / "alpha158_russell1000_pinned_reference.parquet"
+PINNED_REFERENCE_META_PATH = REPO_ROOT / "models" / "lightgbm" / "pinned_reference" / "alpha158_russell1000_pinned_reference_meta.json"
 
 
 ALPHA158_FACTOR_ONTOLOGY: Dict[str, Dict[str, str]] = {
@@ -487,64 +511,69 @@ def calculate_ic_metrics(pred_df: pd.DataFrame, label_df: pd.DataFrame) -> Dict[
     """
     Calculate daily Information Coefficient (IC), Rank IC, Daily ICIR,
     and Annualized ICIR (x sqrt(252)) between predicted score and actual forward return.
+
+    This is an INFORMATIONAL/reporting computation only (feeds the console banner and
+    ``_meta.json``'s "metrics" block) -- it is a separate, hand-rolled computation from
+    Qlib's own ``SigAnaRecord``/``calc_ic`` mechanism. Per the implementation plan
+    (Part 1.4.2 / 3.2.4), the actual quality-gate decision is fed exclusively by
+    ``qlib.contrib.validation.score_quality.extract_ic_metrics(recorder)`` (Qlib's own
+    logged ``IC``/``Rank IC``), so two disagreeing IC computations never coexist inside
+    the gate. This function is retained only because it reports additional detail
+    (annualized ICIR variants, daily observation count) SigAnaRecord does not log.
+
+    NOTE (3.3 P1 fail-closed fix): this used to return an all-zero dict on both
+    exception and empty-merge, making "the computation broke" indistinguishable from
+    "IC is genuinely ~0". It now raises in both cases -- callers must not swallow this.
     """
-    try:
-        # Align prediction and label on (datetime, instrument)
-        merged = pd.concat([pred_df.rename(columns={pred_df.columns[0]: "pred"}),
-                            label_df.rename(columns={label_df.columns[0]: "label"})], axis=1).dropna()
-        if merged.empty:
-            return {
-                "mean_ic": 0.0,
-                "rank_ic": 0.0,
-                "icir": 0.0,
-                "annualized_icir": 0.0,
-                "rank_icir": 0.0,
-                "annualized_rank_icir": 0.0,
-                "daily_observations": 0,
-            }
+    if pred_df is None or label_df is None:
+        raise ValueError("calculate_ic_metrics: pred_df and label_df must both be provided (got a None).")
 
-        daily_ics = []
-        daily_rank_ics = []
+    # Align prediction and label on (datetime, instrument)
+    merged = pd.concat([pred_df.rename(columns={pred_df.columns[0]: "pred"}),
+                        label_df.rename(columns={label_df.columns[0]: "label"})], axis=1).dropna()
+    if merged.empty:
+        raise ValueError(
+            "calculate_ic_metrics: prediction/label merge produced 0 rows after dropna() -- "
+            "cannot compute IC metrics from empty data. This must not be silently reported as IC=0."
+        )
 
-        for date, group in merged.groupby(level=0):
-            if len(group) >= 3:
-                ic = group["pred"].corr(group["label"], method="pearson")
-                rank_ic = group["pred"].corr(group["label"], method="spearman")
-                if not np.isnan(ic):
-                    daily_ics.append(ic)
-                if not np.isnan(rank_ic):
-                    daily_rank_ics.append(rank_ic)
+    daily_ics = []
+    daily_rank_ics = []
 
-        ic_mean = float(np.mean(daily_ics)) if daily_ics else 0.0
-        ic_std = float(np.std(daily_ics)) if daily_ics else 1.0
-        rank_ic_mean = float(np.mean(daily_rank_ics)) if daily_rank_ics else 0.0
-        rank_ic_std = float(np.std(daily_rank_ics)) if daily_rank_ics else 1.0
+    for date, group in merged.groupby(level=0):
+        if len(group) >= 3:
+            ic = group["pred"].corr(group["label"], method="pearson")
+            rank_ic = group["pred"].corr(group["label"], method="spearman")
+            if not np.isnan(ic):
+                daily_ics.append(ic)
+            if not np.isnan(rank_ic):
+                daily_rank_ics.append(rank_ic)
 
-        icir = float(ic_mean / (ic_std + 1e-12))
-        rank_icir = float(rank_ic_mean / (rank_ic_std + 1e-12))
-        annualized_icir = float(icir * (252.0 ** 0.5))
-        annualized_rank_icir = float(rank_icir * (252.0 ** 0.5))
+    if not daily_ics and not daily_rank_ics:
+        raise ValueError(
+            "calculate_ic_metrics: no date had >= 3 valid observations to correlate -- "
+            "cannot compute IC metrics. This must not be silently reported as IC=0."
+        )
 
-        return {
-            "mean_ic": round(ic_mean, 5),
-            "rank_ic": round(rank_ic_mean, 5),
-            "icir": round(icir, 4),
-            "annualized_icir": round(annualized_icir, 4),
-            "rank_icir": round(rank_icir, 4),
-            "annualized_rank_icir": round(annualized_rank_icir, 4),
-            "daily_observations": len(daily_ics),
-        }
-    except Exception as e:
-        logger.warning(f"Failed calculating IC metrics: {e}")
-        return {
-            "mean_ic": 0.0,
-            "rank_ic": 0.0,
-            "icir": 0.0,
-            "annualized_icir": 0.0,
-            "rank_icir": 0.0,
-            "annualized_rank_icir": 0.0,
-            "daily_observations": 0,
-        }
+    ic_mean = float(np.mean(daily_ics)) if daily_ics else 0.0
+    ic_std = float(np.std(daily_ics)) if daily_ics else 1.0
+    rank_ic_mean = float(np.mean(daily_rank_ics)) if daily_rank_ics else 0.0
+    rank_ic_std = float(np.std(daily_rank_ics)) if daily_rank_ics else 1.0
+
+    icir = float(ic_mean / (ic_std + 1e-12))
+    rank_icir = float(rank_ic_mean / (rank_ic_std + 1e-12))
+    annualized_icir = float(icir * (252.0 ** 0.5))
+    annualized_rank_icir = float(rank_icir * (252.0 ** 0.5))
+
+    return {
+        "mean_ic": round(ic_mean, 5),
+        "rank_ic": round(rank_ic_mean, 5),
+        "icir": round(icir, 4),
+        "annualized_icir": round(annualized_icir, 4),
+        "rank_icir": round(rank_icir, 4),
+        "annualized_rank_icir": round(annualized_rank_icir, 4),
+        "daily_observations": len(daily_ics),
+    }
 
 
 def resolve_factor_attribution(raw_feature_names: List[str], importances: np.ndarray) -> List[Dict[str, Any]]:
@@ -672,6 +701,162 @@ def print_institutional_summary_banner(
     print(b + "\n")
 
 
+def _atomic_write_via(dest: Path, write_fn) -> None:
+    """
+    Write an artifact atomically: ``write_fn(tmp_path)`` performs the actual
+    (library-specific) write to a staging temp path in the SAME directory as
+    ``dest``, then this helper renames it into place with ``os.replace``
+    (atomic on both POSIX and Windows, and overwrites an existing ``dest``).
+
+    This is the mechanism behind the implementation plan's P0 "atomic staged
+    promotion" fix (3.3): every production artifact write goes through this
+    function so a crash or exception mid-write can never leave ``dest``
+    partially written, and the promotion-gate call site in
+    ``train_alpha158_model`` never reaches any of these writes unless
+    ``validate_score_quality`` has already returned successfully.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.parent / f".{dest.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        write_fn(tmp)
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _pickle_writer(obj: Any):
+    """Return a `write_fn(tmp_path)` for `_atomic_write_via` that pickles `obj`, closing the handle."""
+    def _write(tmp: Path) -> None:
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f)
+    return _write
+
+
+def _text_writer(text: str, encoding: str = "utf-8"):
+    """Return a `write_fn(tmp_path)` for `_atomic_write_via` that writes `text`, closing the handle."""
+    def _write(tmp: Path) -> None:
+        with open(tmp, "w", encoding=encoding) as f:
+            f.write(text)
+    return _write
+
+
+def _build_scores_df(pred_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Build the (date, symbol, score, rank, percentile) cross-sectional score
+    table from a recorder's ``pred.pkl``.
+
+    NOTE (3.3 P1 fail-closed fix): this used to be wrapped in a
+    try/except that logged a warning and left ``scores_exported=False``
+    silently dropped from the run summary on any failure. It now raises --
+    an export failure must stop the run (and, downstream, block promotion),
+    never be swallowed into "the run reported success but the score file is
+    stale/missing".
+    """
+    if pred_df is None:
+        raise ValueError("_build_scores_df: pred_df is None -- SignalRecord did not produce a usable pred.pkl.")
+
+    scores_df = pred_df.copy()
+    if isinstance(scores_df, pd.Series):
+        scores_df = scores_df.to_frame("score")
+    elif "score" not in scores_df.columns:
+        scores_df.columns = ["score"]
+
+    scores_df = scores_df.reset_index()
+    if "datetime" in scores_df.columns:
+        scores_df.rename(columns={"datetime": "date"}, inplace=True)
+    if "instrument" in scores_df.columns:
+        scores_df.rename(columns={"instrument": "symbol"}, inplace=True)
+
+    if scores_df.empty:
+        raise ValueError("_build_scores_df: prediction table is empty -- refusing to export an empty score file.")
+    if "date" not in scores_df.columns or "symbol" not in scores_df.columns:
+        raise ValueError(f"_build_scores_df: expected 'date'/'symbol' columns after reset_index(), got {list(scores_df.columns)}.")
+
+    # Compute cross-sectional ranks and percentiles per date.
+    #
+    # NOTE on `method`: this model's score distribution has, on two separate
+    # occasions (see .team-code/20260905-finance_team_review_alpha158_degenerate_score.md
+    # and .team-code/20260908-alpha158_training_audit_and_score_degeneracy_implementation_plan.md),
+    # been degenerate -- e.g. only 232 distinct scores across 908 names, with
+    # ties up to 120-wide, or 7 distinct scores across 903 names. `method="dense"`
+    # ranks *distinct values* (1, 2, 3, ... with no gaps for ties), so under this
+    # much degeneracy it stops meaning "Nth best of the universe" at all -- it
+    # becomes "Nth distinct score value", compressing the reported rank far below
+    # where `percentile` (which correctly divides by the full universe size) puts
+    # the same row. `method="min"` (standard competition ranking: a tied group all
+    # takes the best rank in the group, next distinct value resumes at
+    # group_size + previous_rank) keeps `rank` consistent with `percentile`
+    # regardless of tie width, and rank 1 still means "the single best score" the
+    # way a human expects. The quality gate's distinctness check (3.2.1) is what
+    # actually prevents a degenerate distribution like this from being promoted at
+    # all -- this ranking-method choice is a defense-in-depth consistency
+    # property, not a substitute for that gate.
+    scores_df["rank"] = scores_df.groupby("date")["score"].rank(ascending=False, method="min").astype(int)
+    scores_df["percentile"] = (
+        scores_df.groupby("date")["score"].rank(pct=True, ascending=True) * 100.0
+    ).round(2)
+    return scores_df
+
+
+def _get_git_sha() -> str:
+    """Best-effort git SHA for provenance stamping (3.3 P2). Never raises the training run."""
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(REPO_ROOT), stderr=subprocess.DEVNULL
+        )
+        return sha.decode("utf-8").strip()
+    except Exception as e:
+        logger.warning(f"Could not resolve git SHA for provenance stamping: {e}")
+        return "unknown"
+
+
+def _hash_config(config: Dict[str, Any]) -> str:
+    """Stable sha256 hash of the fully-resolved task config, for provenance stamping (3.3 P2)."""
+    canonical = json.dumps(config, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolve_output_dirs(
+    override_active: bool,
+    model_output_dir: Optional[Path],
+    scores_output_dir: Optional[Path],
+) -> Tuple[Path, Path]:
+    """
+    Resolve the model/score output directories for this run.
+
+    P0 root-cause fix (implementation plan 3.3 / 3.7 step 3): when a
+    hyperparameter override (``--num_boost_round`` today) is active, this
+    function UNCONDITIONALLY forces scratch output paths -- it deliberately
+    ignores any caller-supplied ``model_output_dir``/``scores_output_dir`` --
+    so no flag combination can ever redirect a "quick test" run's output back
+    onto the production artifact paths. This is what makes the override
+    "structurally incapable" of writing to production, not merely
+    discouraged from it.
+    """
+    if override_active:
+        logger.warning(
+            "A hyperparameter override (--num_boost_round) is active. Per the implementation "
+            "plan's P0 root-cause fix, this run's artifacts are FORCED to scratch paths "
+            f"({SMOKETEST_MODEL_DIR}, {SMOKETEST_SCORES_DIR}) regardless of any other argument; "
+            "production artifacts will NOT be touched by this run."
+        )
+        resolved_model_dir = SMOKETEST_MODEL_DIR
+        resolved_scores_dir = SMOKETEST_SCORES_DIR
+    else:
+        resolved_model_dir = model_output_dir if model_output_dir is not None else PRODUCTION_MODEL_DIR
+        resolved_scores_dir = scores_output_dir if scores_output_dir is not None else PRODUCTION_SCORES_DIR
+
+    # Defensive, belt-and-braces assertion: an active override must never resolve
+    # to the real production paths, no matter how this function is refactored later.
+    assert not override_active or resolved_model_dir != PRODUCTION_MODEL_DIR, "override must not resolve to production model dir"
+    assert not override_active or resolved_scores_dir != PRODUCTION_SCORES_DIR, "override must not resolve to production scores dir"
+    return resolved_model_dir, resolved_scores_dir
+
+
 def train_alpha158_model(
     config_path: Path,
     qlib_dir: Path,
@@ -713,11 +898,26 @@ def train_alpha158_model(
     exp_manager["kwargs"]["uri"] = exp_uri
     qlib.init(**config.get("qlib_init"), exp_manager=exp_manager)
 
-    # Fast run override if requested
-    if num_boost_round is not None:
+    # Fast run override if requested. `override_active` gates BOTH the effective
+    # num_boost_round used for training AND (via `_resolve_output_dirs`) whether
+    # this run is even allowed to consider writing to the production artifact
+    # paths at all -- see 3.3 P0 / 3.7 step 3 of the implementation plan.
+    override_active = num_boost_round is not None
+    if override_active:
         config["task"]["model"]["kwargs"]["num_boost_round"] = num_boost_round
+    num_boost_round_effective = config["task"]["model"]["kwargs"].get("num_boost_round", 1000)
 
-    # 3. Execute training via Qlib's task_train
+    resolved_model_dir, resolved_scores_dir = _resolve_output_dirs(override_active, model_output_dir, scores_output_dir)
+    resolved_model_dir.mkdir(parents=True, exist_ok=True)
+    resolved_scores_dir.mkdir(parents=True, exist_ok=True)
+
+    # 3. Execute training via Qlib's task_train. This already runs the full
+    #    `task.record` pipeline declared in the workflow YAML (SignalRecord ->
+    #    SigAnaRecord -> PortAnaRecord), so IC/Rank IC and the portfolio
+    #    backtest's information ratio / annualized return / max drawdown / fill
+    #    rate are ALL already computed and logged to `recorder` by the time this
+    #    call returns -- no separate computation or wiring is needed for the
+    #    quality gate below.
     logger.info(f"Starting Qlib model training (experiment={experiment_name})...")
     recorder = task_train(config.get("task"), experiment_name=experiment_name)
     recorder.save_objects(config=config)
@@ -731,7 +931,11 @@ def train_alpha158_model(
     handler_config = dataset_kwargs.get("handler", {})
     segment_stats = audit_dataset_segments(handler_config, segments_config)
 
-    # Retrieve trained model and test predictions
+    # 5. Retrieve trained model and test predictions, and compute the COMPLETE
+    #    evidence set (model + scores + all metrics) BEFORE anything is written
+    #    to disk -- this is the 3.3 P0 "atomic staged promotion" restructure:
+    #    the gate below runs exactly once against this complete set, and only
+    #    on success does the write phase (Step 6+) begin.
     trained_model = recorder.load_object("params.pkl")
     pred_df = recorder.load_object("pred.pkl")
     try:
@@ -739,48 +943,140 @@ def train_alpha158_model(
     except Exception:
         label_df = None
 
-    # 5. Calculate Information Coefficient metrics
-    ic_metrics = {}
+    # Informational IC/RankIC (banner + meta.json "metrics" block only). Kept
+    # separate from the gate's IC input per Part 1.4.2 / 3.2.4's consolidation:
+    # the gate is fed exclusively by Qlib's own SigAnaRecord-logged IC/Rank IC
+    # (via `extract_ic_metrics`, below), never by this hand-rolled duplicate.
+    ic_metrics_banner: Dict[str, Any] = {}
     if pred_df is not None and label_df is not None:
-        ic_metrics = calculate_ic_metrics(pred_df, label_df)
-        logger.info(f"Validation IC Metrics: {ic_metrics}")
+        ic_metrics_banner = calculate_ic_metrics(pred_df, label_df)
+        logger.info(f"Validation IC Metrics (informational): {ic_metrics_banner}")
+    else:
+        logger.warning("pred.pkl/label.pkl unavailable -- informational IC banner metrics will show as empty.")
 
-    # Resolve output directories
-    if model_output_dir is None:
-        model_output_dir = REPO_ROOT / "models" / "lightgbm"
-    if scores_output_dir is None:
-        scores_output_dir = REPO_ROOT / "output" / "scores"
+    scores_df = _build_scores_df(pred_df)
 
-    model_output_dir.mkdir(parents=True, exist_ok=True)
-    scores_output_dir.mkdir(parents=True, exist_ok=True)
+    ic_metrics_gate = extract_ic_metrics(recorder)
+    portfolio_metrics_gate = extract_portfolio_metrics(recorder)
+    logger.info(f"Gate input -- IC/Rank IC (from SigAnaRecord): {ic_metrics_gate}")
+    logger.info(f"Gate input -- portfolio metrics (from PortAnaRecord): {portfolio_metrics_gate}")
 
-    # 6. Save production model binary (.pkl)
-    prod_model_pkl = model_output_dir / "alpha158_russell1000_latest.pkl"
-    import pickle
-    with open(prod_model_pkl, "wb") as f:
-        pickle.dump(trained_model, f)
-    logger.info(f"Saved production model pickle to: {prod_model_pkl.resolve()}")
-
-    # 7. Save native LightGBM booster text (.txt) and resolve factor attribution
-    prod_model_txt = model_output_dir / "alpha158_russell1000_latest.txt"
+    # Feature attribution / num_trees are read directly off the in-memory
+    # booster -- NOT via `save_model()` to a real path -- so nothing is written
+    # to disk before the gate has had a chance to run.
     feature_importances: List[Dict[str, Any]] = []
     num_trees = 0
+    booster = getattr(trained_model, "model", None)
+    if booster is not None:
+        raw_feature_names = booster.feature_name()
+        importances = booster.feature_importance(importance_type="gain")
+        num_trees = booster.num_trees()
+        feature_importances = resolve_factor_attribution(raw_feature_names, importances)
+        logger.info(f"Model Quality Check: num_trees={num_trees}")
+    else:
+        logger.warning("Trained model has no native LightGBM booster -- num_trees/feature attribution unavailable.")
 
-    if hasattr(trained_model, "model") and trained_model.model is not None:
+    # check 3.2.5 is sequenced last, per the implementation plan: it stays
+    # dormant (pinned_reference=None) until a clean run has been produced and
+    # explicitly blessed via `bless_pinned_reference` (see below main()).
+    pinned_reference_df: Optional[pd.DataFrame] = None
+    if PINNED_REFERENCE_PATH.exists():
         try:
-            trained_model.model.save_model(str(prod_model_txt))
-            logger.info(f"Saved native LightGBM booster text to: {prod_model_txt.resolve()}")
-            raw_feature_names = trained_model.model.feature_name()
-            importances = trained_model.model.feature_importance(importance_type="gain")
-            num_trees = trained_model.model.num_trees()
-            logger.info(f"Model Quality Check: num_trees={num_trees}")
-
-            feature_importances = resolve_factor_attribution(raw_feature_names, importances)
+            pinned_reference_df = pd.read_parquet(PINNED_REFERENCE_PATH)
+            logger.info(f"Loaded pinned reference for check 3.2.5: {PINNED_REFERENCE_PATH}")
         except Exception as e:
-            logger.warning(f"Could not dump native booster text: {e}")
+            logger.warning(f"Could not load pinned reference at {PINNED_REFERENCE_PATH}: {e}. Check 3.2.5 will be skipped.")
 
-    # 8. Save comprehensive model metadata (.json)
+    as_of_date = datetime.datetime.utcnow().date()
+
+    # 6. Run the quality gate EXACTLY ONCE against the complete evidence set.
+    #
+    # `enforce_gate` is False only for an active hyperparameter-override
+    # ("quick test") run: such a run is, by construction (`_resolve_output_dirs`
+    # above), already incapable of reaching the production artifact paths, so
+    # blocking it on the gate too would defeat its purpose as a fast dev-loop
+    # tool (a deliberately tiny num_boost_round is EXPECTED to fail the
+    # num_trees floor). The gate still runs and its result is still logged
+    # loudly for a smoke-test run -- it just doesn't raise.
+    enforce_gate = not override_active
+    gate_report = None
+    gate_exception: Optional[ScoreQualityGateError] = None
+    try:
+        gate_report = validate_score_quality(
+            scores_df,
+            ic_metrics_gate,
+            portfolio_metrics_gate,
+            trained_model,
+            num_boost_round_cap=num_boost_round_effective,
+            as_of_date=as_of_date,
+            pinned_reference=pinned_reference_df,
+        )
+        for w in gate_report.warnings:
+            logger.warning(f"Quality gate warning: {w}")
+        logger.info("Quality gate PASSED.")
+    except ScoreQualityGateError as e:
+        gate_exception = e
+        for f in e.report.failures:
+            logger.error(f"Quality gate FAILURE: {f}")
+        if enforce_gate:
+            logger.error(
+                "Quality gate FAILED -- refusing to promote this run. No production artifact "
+                "(models/lightgbm/alpha158_russell1000_latest.* or "
+                "output/scores/alpha158_russell1000_latest.*) has been touched."
+            )
+            raise
+        else:
+            logger.warning(
+                "Quality gate FAILED but this is a hyperparameter-override (smoke-test) run -- "
+                "writing to scratch paths only, as intended for a quick dev-loop iteration."
+            )
+        gate_report = gate_exception.report
+
+    # ------------------------------------------------------------------
+    # WRITE PHASE -- reached only if the gate passed (or this is a
+    # non-enforced override/smoke-test run). Every write below goes through
+    # `_atomic_write_via`: staged to a temp path in the destination directory,
+    # then atomically renamed into place (3.3 P0).
+    # ------------------------------------------------------------------
     date_tag = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    prod_model_pkl = resolved_model_dir / "alpha158_russell1000_latest.pkl"
+    _atomic_write_via(prod_model_pkl, _pickle_writer(trained_model))
+    logger.info(f"Saved production model pickle to: {prod_model_pkl.resolve()}")
+
+    prod_model_txt = resolved_model_dir / "alpha158_russell1000_latest.txt"
+    if booster is not None:
+        _atomic_write_via(prod_model_txt, lambda tmp: booster.save_model(str(tmp)))
+        logger.info(f"Saved native LightGBM booster text to: {prod_model_txt.resolve()}")
+
+    # Versioned model checkpoint (pre-existing pattern).
+    checkpoint_dir = resolved_model_dir / "checkpoints"
+    checkpoint_pkl = checkpoint_dir / f"alpha158_russell1000_{date_tag}.pkl"
+    _atomic_write_via(checkpoint_pkl, _pickle_writer(trained_model))
+
+    # Versioned score-file checkpoint (NEW -- 3.3 P0 / 3.7 step 2 item 5:
+    # the .pkl already had a rollback path via `checkpoints/`; the score file
+    # -- the artifact type BOTH real incidents actually corrupted -- did not).
+    scores_checkpoint_dir = resolved_scores_dir / "checkpoints"
+    scores_checkpoint_parquet = scores_checkpoint_dir / f"alpha158_russell1000_scores_{date_tag}.parquet"
+    _atomic_write_via(scores_checkpoint_parquet, lambda tmp: scores_df.to_parquet(tmp, index=False))
+
+    parquet_path = resolved_scores_dir / "alpha158_russell1000_latest.parquet"
+    csv_path = resolved_scores_dir / "alpha158_russell1000_latest.csv"
+    _atomic_write_via(parquet_path, lambda tmp: scores_df.to_parquet(tmp, index=False))
+    _atomic_write_via(csv_path, lambda tmp: scores_df.to_csv(tmp, index=False))
+    logger.info(f"Exported {len(scores_df)} scores to {parquet_path.resolve()} and {csv_path.resolve()}")
+
+    # Provenance stamping (3.3 P2): git SHA, config hash, and seed alongside
+    # the hyperparameters already captured -- without this, "was this artifact
+    # produced by the blessed config?" is unanswerable after the fact, and
+    # check 3.2.5's pinned reference has nothing durable to pin to.
+    provenance = {
+        "git_sha": _get_git_sha(),
+        "config_hash_sha256": _hash_config(config),
+        "seed": config["task"]["model"]["kwargs"].get("seed", "not_set (lightgbm/qlib default)"),
+    }
+
     meta_data = {
         "model_name": "LightGBM_Alpha158_Russell1000",
         "trained_at_utc": datetime.datetime.utcnow().isoformat(),
@@ -789,6 +1085,8 @@ def train_alpha158_model(
         "recorder_id": recorder.id,
         "market": market,
         "provider_uri": qlib_dir_str,
+        "provenance": provenance,
+        "override_active": override_active,
         "universe_audit": {
             "targeted_total": universe_audit.get("targeted_total", 0),
             "valid_count": universe_audit.get("valid_count", 0),
@@ -807,81 +1105,25 @@ def train_alpha158_model(
             for k, v in segment_stats.items()
         },
         "hyperparameters": config["task"]["model"]["kwargs"],
-        "metrics": ic_metrics,
+        "metrics": ic_metrics_banner,
+        "gate_metrics": {"ic": ic_metrics_gate, "portfolio": portfolio_metrics_gate},
+        "quality_gate": gate_report.to_dict() if gate_report is not None else None,
         "features_count": len(feature_importances),
         "num_trees": num_trees,
         "top_10_features": feature_importances[:10] if feature_importances else [],
     }
-    prod_model_meta = model_output_dir / "alpha158_russell1000_latest_meta.json"
-    with open(prod_model_meta, "w", encoding="utf-8") as f:
-        json.dump(meta_data, f, indent=4, default=str)
+    prod_model_meta = resolved_model_dir / "alpha158_russell1000_latest_meta.json"
+    _atomic_write_via(prod_model_meta, _text_writer(json.dumps(meta_data, indent=4, default=str)))
     logger.info(f"Saved model metadata to: {prod_model_meta.resolve()}")
 
-    # 9. Save versioned checkpoint
-    checkpoint_dir = model_output_dir / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_pkl = checkpoint_dir / f"alpha158_russell1000_{date_tag}.pkl"
-    with open(checkpoint_pkl, "wb") as f:
-        pickle.dump(trained_model, f)
-
-    # 10. Export out-of-sample cross-sectional score table
-    scores_exported = False
-    parquet_path = scores_output_dir / "alpha158_russell1000_latest.parquet"
-    csv_path = scores_output_dir / "alpha158_russell1000_latest.csv"
-
-    if pred_df is not None:
-        try:
-            scores_df = pred_df.copy()
-            if isinstance(scores_df, pd.Series):
-                scores_df = scores_df.to_frame("score")
-            elif "score" not in scores_df.columns:
-                scores_df.columns = ["score"]
-
-            scores_df = scores_df.reset_index()
-            if "datetime" in scores_df.columns:
-                scores_df.rename(columns={"datetime": "date"}, inplace=True)
-            if "instrument" in scores_df.columns:
-                scores_df.rename(columns={"instrument": "symbol"}, inplace=True)
-
-            # Compute cross-sectional ranks and percentiles per date.
-            #
-            # NOTE on `method`: this model's score distribution is known to be
-            # degenerate (see .team-code/20260905-finance_team_review_alpha158_degenerate_score.md
-            # -- e.g. on 2026-09-04, only 232 distinct scores across 908 names,
-            # with ties up to 120-wide). `method="dense"` ranks *distinct values*
-            # (1, 2, 3, ... with no gaps for ties), so under this much degeneracy
-            # it stops meaning "Nth best of the universe" at all -- it becomes
-            # "Nth distinct score value", compressing the reported rank far below
-            # where `percentile` (which correctly divides by the full universe
-            # size) puts the same row. That divergence is what an adversarial
-            # audit flagged as rank 179 of 908 (dense) implying an ~80th
-            # percentile while the stored `percentile` column correctly showed
-            # ~52%. `method="min"` (standard competition ranking: a tied group
-            # all takes the best rank in the group, next distinct value resumes
-            # at group_size + previous_rank) keeps `rank` consistent with
-            # `percentile` regardless of tie width, and rank 1 still means "the
-            # single best score" the way a human expects.
-            scores_df["rank"] = scores_df.groupby("date")["score"].rank(ascending=False, method="min").astype(int)
-            scores_df["percentile"] = (
-                scores_df.groupby("date")["score"].rank(pct=True, ascending=True) * 100.0
-            ).round(2)
-
-            scores_df.to_parquet(parquet_path, index=False)
-            scores_df.to_csv(csv_path, index=False)
-            logger.info(f"Exported {len(scores_df)} scores to {parquet_path.resolve()} and {csv_path.resolve()}")
-            scores_exported = True
-        except Exception as e:
-            logger.warning(f"Failed exporting scores: {e}")
-
-    # 11. Render Institutional Summary Banner
+    # 7. Render Institutional Summary Banner
     artifact_paths = {
         "Production Model (.pkl)": prod_model_pkl,
         "Booster Text (.txt)": prod_model_txt,
         "Model Metadata (.json)": prod_model_meta,
+        "Latest Scores (.parquet)": parquet_path,
+        "Latest Scores (.csv)": csv_path,
     }
-    if scores_exported:
-        artifact_paths["Latest Scores (.parquet)"] = parquet_path
-        artifact_paths["Latest Scores (.csv)"] = csv_path
 
     print_institutional_summary_banner(
         market=market,
@@ -895,7 +1137,7 @@ def train_alpha158_model(
             "subsample": config["task"]["model"]["kwargs"].get("subsample", 0.88),
             "colsample_bytree": config["task"]["model"]["kwargs"].get("colsample_bytree", 0.89),
         },
-        ic_metrics=ic_metrics,
+        ic_metrics=ic_metrics_banner,
         top_features=feature_importances,
         artifact_paths=artifact_paths,
     )
@@ -904,11 +1146,70 @@ def train_alpha158_model(
         "status": "success",
         "model_path": str(prod_model_pkl),
         "metadata_path": str(prod_model_meta),
-        "ic_metrics": ic_metrics,
+        "ic_metrics": ic_metrics_banner,
+        "gate_report": gate_report.to_dict() if gate_report is not None else None,
+        "gate_passed": bool(gate_report.passed) if gate_report is not None else None,
+        "override_active": override_active,
         "recorder_id": recorder.id,
         "universe_audit": universe_audit,
         "segment_dimensions": segment_stats,
     }
+
+
+def bless_pinned_reference(
+    scores_parquet_path: Optional[Path] = None,
+    meta_path: Optional[Path] = None,
+) -> Path:
+    """
+    Explicitly bless a scores file as the immutable, pinned reference for
+    quality-gate check 3.2.5 (rank-correlation-vs-pinned-reference).
+
+    This is a DELIBERATE, manual, operator-invoked action (``--bless_pinned_reference``
+    on the CLI) -- never automatic, even on a passing training run. Per the
+    implementation plan's 3.2.5 "Critical correction from review": the pinned
+    reference must never be implicitly equal to "whatever currently occupies
+    the production path" (that was precisely how the original design would
+    have anchored the check to an already-corrupt baseline). Call this only
+    after independently confirming the source run passed
+    ``validate_score_quality`` -- see the training run's own
+    ``alpha158_russell1000_latest_meta.json["quality_gate"]["passed"]``.
+
+    Defaults to blessing the current production
+    ``output/scores/alpha158_russell1000_latest.parquet`` /
+    ``models/lightgbm/alpha158_russell1000_latest_meta.json`` pair.
+    """
+    scores_parquet_path = scores_parquet_path or (PRODUCTION_SCORES_DIR / "alpha158_russell1000_latest.parquet")
+    meta_path = meta_path or (PRODUCTION_MODEL_DIR / "alpha158_russell1000_latest_meta.json")
+
+    if not scores_parquet_path.exists():
+        raise FileNotFoundError(f"Cannot bless pinned reference: {scores_parquet_path} does not exist.")
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        source_meta = json.load(f)
+
+    quality_gate = source_meta.get("quality_gate") or {}
+    if not quality_gate.get("passed", False):
+        raise ValueError(
+            f"Refusing to bless {scores_parquet_path} as the pinned reference: its own metadata "
+            f"({meta_path}) does not record a passing quality_gate result (quality_gate={quality_gate})."
+        )
+
+    scores_df = pd.read_parquet(scores_parquet_path)
+    _atomic_write_via(PINNED_REFERENCE_PATH, lambda tmp: scores_df.to_parquet(tmp, index=False))
+
+    blessing_meta = {
+        "blessed_at_utc": datetime.datetime.utcnow().isoformat(),
+        "source_scores_path": str(scores_parquet_path.resolve()),
+        "source_recorder_id": source_meta.get("recorder_id"),
+        "source_provenance": source_meta.get("provenance"),
+        "source_quality_gate": quality_gate,
+        "row_count": int(len(scores_df)),
+        "date_span": [str(scores_df["date"].min()), str(scores_df["date"].max())] if "date" in scores_df.columns else None,
+        "git_sha_at_blessing": _get_git_sha(),
+    }
+    _atomic_write_via(PINNED_REFERENCE_META_PATH, _text_writer(json.dumps(blessing_meta, indent=4, default=str)))
+    logger.info(f"Blessed {scores_parquet_path} as the pinned reference -> {PINNED_REFERENCE_PATH}")
+    return PINNED_REFERENCE_PATH
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -944,7 +1245,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--num_boost_round",
         type=int,
         default=None,
-        help="Override number of boosting rounds for quick testing.",
+        help=(
+            "Override number of boosting rounds for quick testing. WARNING: activating this "
+            "override FORCES output to scratch paths (models/lightgbm/_smoketest/, "
+            "output/scores/_smoketest/) -- no combination of arguments can redirect an override "
+            "run's output back onto the production artifact paths (models/lightgbm/"
+            "alpha158_russell1000_latest.* / output/scores/alpha158_russell1000_latest.*)."
+        ),
+    )
+    parser.add_argument(
+        "--bless_pinned_reference",
+        action="store_true",
+        help=(
+            "Do not train. Instead, explicitly bless the CURRENT production scores file as the "
+            "pinned, immutable reference used by quality-gate check 3.2.5 (rank-correlation-vs-"
+            "pinned-reference). Refuses to run unless that production run's own metadata records "
+            "a passing quality gate."
+        ),
     )
     return parser
 
@@ -952,6 +1269,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.bless_pinned_reference:
+        bless_pinned_reference()
+        return
 
     config_p = Path(args.config)
     if not config_p.is_absolute():
