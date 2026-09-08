@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Russell 1000 Alpha158 Factor + Executive Verdict Cross-Sectional Screen
-======================================================================
-Builds ONE consolidated institutional dashboard covering every name in the
-Russell 1000 universe with, per ticker:
+Alpha158 Factor + Executive Verdict Cross-Sectional Screen
+============================================================
+Builds ONE consolidated institutional dashboard covering every name in a
+user-supplied instrument universe (defaults to the repo's Russell 1000 list
+when no ticker source is given) with, per ticker:
 
   1. LightGBM Alpha158 factor score + cross-sectional rank + percentile
   2. Executive Investment Verdict  (repo-canonical taxonomy, reused verbatim
@@ -17,6 +18,12 @@ THIS IS A FAST CROSS-SECTIONAL SCREEN, NOT A SINGLE-TICKER DEEP DIVE.
 See `SCREEN_LIMITATIONS` below for exactly which signals are absent; they are
 rendered onto the report itself so a reader can never mistake one for the other.
 
+Note: the Alpha158 scores joined onto each row (`--scores`) come from a
+LightGBM model trained specifically on the Russell 1000 universe. Tickers
+outside that trained universe will resolve zero factor score and are recorded
+in `skipped` (see `load_latest_alpha_scores`) -- this screen generalizes which
+tickers it *evaluates*, not which model produced the joined factor score.
+
 PRICE SOURCE WARNING
 --------------------
 This module deliberately does NOT use `qlib.data.D.features`. The binary store
@@ -24,13 +31,20 @@ at `D:/trading/qlib/qlib_data` is misaligned: feature `.bin` files hold 1930
 values against a 1500-entry calendar (857/909 tickers affected), so `D.features`
 returns prices shifted ~430 trading days and labels 2024-12-16 data as
 2026-09-04. Prices are therefore read from the upstream local source CSVs, which
-are offline, complete for all 908 names, and denominated in real dollars.
-Full evidence: `.team-code/20260905-russell1000_factor_verdict_screen-implementation_plan.md`.
+are offline, complete for all 908 Russell 1000 names, and denominated in real
+dollars. Full evidence: `.team-code/20260905-russell1000_factor_verdict_screen-
+implementation_plan.md`.
 
 Usage
 -----
-    python scripts/russell1000_factor_verdict_screen.py
-    python scripts/russell1000_factor_verdict_screen.py --limit 25   # smoke test
+    python scripts/factor_verdict_screen.py
+    python scripts/factor_verdict_screen.py --limit 25                        # smoke test, default Russell 1000 universe
+    python scripts/factor_verdict_screen.py --tickers AAPL,MSFT,NVDA,GOOGL,AMZN  # explicit list
+    python scripts/factor_verdict_screen.py --tickers-csv my_watchlist.csv
+    python scripts/factor_verdict_screen.py --tickers-json my_watchlist.json
+
+Ticker-universe source precedence (see `resolve_ticker_universe`):
+    --tickers  >  --tickers-csv  >  --tickers-json  >  --universe (file, default Russell 1000)
 """
 
 from __future__ import annotations
@@ -42,9 +56,10 @@ import html
 import logging
 import argparse
 import datetime
+import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -179,8 +194,36 @@ class ScreenRow:
 # Layer 1 -- local price loading
 # ----------------------------------------------------------------------
 
+def _normalize_symbols(symbols: Iterable[str]) -> List[str]:
+    """
+    Shared normalization contract for every ticker source: strip whitespace,
+    upper-case, drop blanks, preserve first-seen order, drop duplicates.
+
+    Every loader below (`load_universe`, `parse_tickers_arg`,
+    `load_tickers_csv`, `load_tickers_json`) funnels through this one helper
+    so all four ticker-universe sources behave identically -- reusing the
+    exact normalization `load_universe` has always applied rather than adding
+    a second, subtly different implementation per source.
+    """
+    seen = set()
+    out: List[str] = []
+    for raw in symbols:
+        s = str(raw).strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 def load_universe(universe_file: Path) -> List[str]:
-    """Read the Russell 1000 instrument list (tab-separated: SYMBOL start end)."""
+    """
+    Read a tab-separated qlib instruments universe file (`SYMBOL start end`
+    per line, e.g. `data/instruments/russell1000.txt`). This is the default
+    ticker source (via `--universe`, itself defaulting to the Russell 1000
+    file) when no `--tickers` / `--tickers-csv` / `--tickers-json` flag is
+    given -- see `resolve_ticker_universe`.
+    """
     symbols: List[str] = []
     with open(universe_file, "r", encoding="utf-8") as fh:
         for line in fh:
@@ -188,14 +231,172 @@ def load_universe(universe_file: Path) -> List[str]:
             if not line:
                 continue
             symbols.append(line.split("\t")[0].split()[0].strip().upper())
-    # Preserve order, drop duplicates
-    seen = set()
-    out = []
-    for s in symbols:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
+    return _normalize_symbols(symbols)
+
+
+def parse_tickers_arg(raw: str) -> List[str]:
+    """Parse a `--tickers` comma-separated CLI value into a symbol list."""
+    return _normalize_symbols(part for part in raw.split(",") if part.strip())
+
+
+def _looks_like_ticker(token: str) -> bool:
+    """
+    Heuristic: a bare token that plausibly IS a ticker, not a descriptive
+    header word. Ticker files in this repo (e.g. `data/instruments/
+    russell1000.txt`) always write symbols upper-case, so requiring the token
+    to already equal its own upper-cased form excludes ordinary lower/mixed
+    -case header labels ("watchlist", "Symbol") while accepting "AAPL" or
+    "BRK.B". A headerless CSV should therefore use upper-case tickers; one
+    written lower-case loses its first row to being treated as a header --
+    documented in `factor_verdict_screen.md`.
+    """
+    token = token.strip()
+    if not token or len(token) > 10 or token != token.upper():
+        return False
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9.\-]*", token))
+
+
+def load_tickers_csv(path: Path) -> List[str]:
+    """
+    Load tickers from a CSV file. Accepts either a column named (case
+    insensitively) `symbol`/`symbols`/`ticker`/`tickers`, or a single-column
+    file. A single-column file's header cell is treated as data (not
+    discarded) when it itself looks like a ticker rather than a label --
+    supporting both a headered file (`symbol\\nAAPL\\nMSFT`) and a bare,
+    headerless list (`AAPL\\nMSFT`).
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"--tickers-csv file not found: {path}")
+
+    df = pd.read_csv(path, dtype=str)
+    normalized_cols = {c.strip().lower(): c for c in df.columns}
+    known = ("symbol", "symbols", "ticker", "tickers")
+    match = next((normalized_cols[k] for k in known if k in normalized_cols), None)
+
+    if match is not None:
+        values = df[match].dropna().tolist()
+    elif df.shape[1] == 1:
+        col = df.columns[0]
+        values = df[col].dropna().tolist()
+        if col.strip().lower() not in known and _looks_like_ticker(col):
+            values = [col] + values
+    else:
+        raise ValueError(
+            f"--tickers-csv {path}: could not identify a ticker column. "
+            f"Expected a column named one of {known} or a single-column file; "
+            f"found columns {list(df.columns)}"
+        )
+
+    return _normalize_symbols(values)
+
+
+def load_tickers_json(path: Path) -> List[str]:
+    """
+    Load tickers from a JSON file: either a bare array of ticker strings, or
+    an object with a `tickers` or `symbols` key holding that array.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"--tickers-json file not found: {path}")
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, list):
+        values = raw
+    elif isinstance(raw, dict):
+        key = next((k for k in ("tickers", "symbols") if k in raw), None)
+        if key is None:
+            raise ValueError(
+                f"--tickers-json {path}: JSON object must contain a 'tickers' or "
+                f"'symbols' key holding an array of ticker strings (found keys: "
+                f"{sorted(raw.keys())})"
+            )
+        values = raw[key]
+        if not isinstance(values, list):
+            raise ValueError(f"--tickers-json {path}: '{key}' must be a JSON array of ticker strings")
+    else:
+        raise ValueError(
+            f"--tickers-json {path}: expected a JSON array or an object with a "
+            f"'tickers'/'symbols' key, got {type(raw).__name__}"
+        )
+
+    return _normalize_symbols(values)
+
+
+def _slugify_label(text: str) -> str:
+    """Filename-safe slug for the output report naming (`_universe_label`)."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", text.strip()).strip("_").lower()
+    return slug or "custom"
+
+
+def resolve_ticker_universe(args: argparse.Namespace) -> Tuple[List[str], str, str]:
+    """
+    Resolve the ticker universe from CLI args per the documented precedence:
+
+        --tickers  >  --tickers-csv  >  --tickers-json  >  --universe (file)
+
+    `--universe` defaults to `data/instruments/russell1000.txt`, so calling
+    this with none of the three new flags reproduces the exact pre-existing
+    default behavior (`load_universe(DEFAULT_UNIVERSE_FILE)`).
+
+    If more than one of `--tickers` / `--tickers-csv` / `--tickers-json` is
+    supplied, the highest-precedence one is used and a warning names which
+    flags were ignored -- multiple sources are accepted, never silently
+    combined or silently mis-selected.
+
+    Returns `(symbols, universe_label, universe_display)`:
+      - `universe_label` -- filename-safe slug used in the report filename.
+      - `universe_display` -- human-readable name rendered onto the report.
+
+    Raises `ValueError` if the resolved, normalized symbol list is empty.
+    """
+    supplied = [flag for flag, val in (
+        ("--tickers", args.tickers),
+        ("--tickers-csv", args.tickers_csv),
+        ("--tickers-json", args.tickers_json),
+    ) if val]
+    if len(supplied) > 1:
+        logger.warning(
+            "Multiple ticker-universe sources supplied (%s); using %s per precedence "
+            "order (--tickers > --tickers-csv > --tickers-json > --universe).",
+            ", ".join(supplied), supplied[0],
+        )
+
+    if args.tickers:
+        symbols = parse_tickers_arg(args.tickers)
+        source_desc = "--tickers"
+        default_label = "custom"
+        default_display = f"Custom ({len(symbols)} tickers)"
+    elif args.tickers_csv:
+        csv_path = Path(args.tickers_csv)
+        symbols = load_tickers_csv(csv_path)
+        source_desc = f"--tickers-csv={csv_path}"
+        default_label = _slugify_label(csv_path.stem)
+        default_display = csv_path.stem.replace("_", " ").replace("-", " ").title()
+    elif args.tickers_json:
+        json_path = Path(args.tickers_json)
+        symbols = load_tickers_json(json_path)
+        source_desc = f"--tickers-json={json_path}"
+        default_label = _slugify_label(json_path.stem)
+        default_display = json_path.stem.replace("_", " ").replace("-", " ").title()
+    else:
+        universe_path = Path(args.universe)
+        symbols = load_universe(universe_path)
+        source_desc = f"--universe={universe_path}"
+        if universe_path.resolve() == DEFAULT_UNIVERSE_FILE.resolve():
+            default_label = "russell1000"
+            default_display = "Russell 1000"
+        else:
+            default_label = _slugify_label(universe_path.stem)
+            default_display = universe_path.stem.replace("_", " ").replace("-", " ").title()
+
+    if not symbols:
+        raise ValueError(
+            f"Ticker universe resolved to zero names from {source_desc}. "
+            f"Provide at least one valid ticker."
+        )
+
+    universe_label = _slugify_label(args.universe_name) if args.universe_name else default_label
+    universe_display = args.universe_name if args.universe_name else default_display
+    return symbols, universe_label, universe_display
 
 
 def load_local_ohlcv(symbol: str, market_data_root: Path) -> pd.DataFrame:
@@ -377,15 +578,20 @@ def analyse_symbol(
 
 
 def run_screen(
+    symbols: List[str],
     market_data_root: Path = DEFAULT_MARKET_DATA_ROOT,
-    universe_file: Path = DEFAULT_UNIVERSE_FILE,
     scores_file: Path = DEFAULT_SCORES_FILE,
     limit: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Run the full cross-sectional screen. Returns a render-ready payload."""
+    """
+    Run the full cross-sectional screen over an already-resolved ticker list.
+    Returns a render-ready payload. Universe resolution (which tickers to
+    screen, from the CLI list / CSV / JSON / default file) happens in the
+    caller via `resolve_ticker_universe` -- this function only screens the
+    symbols it is given.
+    """
     t0 = time.time()
 
-    symbols = load_universe(universe_file)
     alpha_cs, alpha_as_of = load_latest_alpha_scores(scores_file)
     alpha_by_symbol = {r["symbol"]: r for _, r in alpha_cs.iterrows()}
 
@@ -467,6 +673,7 @@ def build_screen_html(payload: Dict[str, Any]) -> str:
     """Render the consolidated dark institutional dashboard."""
     rows: List[ScreenRow] = payload["rows"]
     skipped: List[Dict[str, str]] = payload["skipped"]
+    universe_display = payload.get("universe_display") or "Russell 1000"
 
     # Default sort: Alpha158 percentile descending (best names first).
     rows_sorted = sorted(rows, key=lambda r: (-r.alpha_percentile, r.alpha_rank, r.symbol))
@@ -630,7 +837,7 @@ def build_screen_html(payload: Dict[str, Any]) -> str:
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Russell 1000 Alpha158 Factor &amp; Verdict Screen &mdash; {_esc(payload["alpha_as_of"])}</title>
+<title>{_esc(universe_display)} Alpha158 Factor &amp; Verdict Screen &mdash; {_esc(payload["alpha_as_of"])}</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   body {{ background:#030712; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }}
@@ -650,7 +857,7 @@ def build_screen_html(payload: Dict[str, Any]) -> str:
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
         <div class="flex items-center gap-3 flex-wrap">
-          <h1 class="text-2xl font-black text-white tracking-tight">Russell 1000 &mdash; Alpha158 Factor &amp; Executive Verdict Screen</h1>
+          <h1 class="text-2xl font-black text-white tracking-tight">{_esc(universe_display)} &mdash; Alpha158 Factor &amp; Executive Verdict Screen</h1>
           <span class="text-[10px] font-bold px-2.5 py-1 rounded-full border bg-amber-500/15 text-amber-300 border-amber-500/40">
             CROSS-SECTIONAL SCREEN &mdash; NOT A SINGLE-TICKER DEEP DIVE
           </span>
@@ -824,7 +1031,7 @@ def build_screen_html(payload: Dict[str, Any]) -> str:
   </div>
 
   <div class="text-[10px] text-gray-600 text-center pb-6 leading-relaxed">
-    Generated by <span class="font-mono">scripts/russell1000_factor_verdict_screen.py</span> &bull;
+    Generated by <span class="font-mono">scripts/factor_verdict_screen.py</span> &bull;
     Verdict taxonomy: <span class="font-mono">scripts/verdict_taxonomy.py</span> &bull;
     Forecast engine: <span class="font-mono">scripts/predictive_engine.py</span>
     ({payload["simulations"]} seeded Monte Carlo paths, {payload["forecast_days"]} trading-day horizon; deterministic, seed=42)
@@ -892,26 +1099,66 @@ def build_screen_html(payload: Dict[str, Any]) -> str:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    ap = argparse.ArgumentParser(description="Russell 1000 Alpha158 + Executive Verdict screen")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Alpha158 factor + Executive Verdict cross-sectional screen over a "
+            "user-supplied instrument universe (defaults to the repo's Russell "
+            "1000 list when no ticker source flag is given)."
+        )
+    )
     ap.add_argument("--market-data-root", default=str(DEFAULT_MARKET_DATA_ROOT))
-    ap.add_argument("--universe", default=str(DEFAULT_UNIVERSE_FILE))
+    ap.add_argument(
+        "--universe", default=str(DEFAULT_UNIVERSE_FILE),
+        help=(
+            "Tab-separated qlib instruments file (SYMBOL start end per line). "
+            "Used only when none of --tickers / --tickers-csv / --tickers-json "
+            "is given. Defaults to the repo's Russell 1000 list."
+        ),
+    )
+    ap.add_argument(
+        "--tickers", default=None,
+        help="Comma-separated ticker list, e.g. 'AAPL,MSFT,NVDA'. Highest precedence ticker source.",
+    )
+    ap.add_argument(
+        "--tickers-csv", default=None,
+        help="CSV file of tickers: a 'symbol'/'ticker' column, or a single column.",
+    )
+    ap.add_argument(
+        "--tickers-json", default=None,
+        help="JSON file of tickers: a bare array, or an object with a 'tickers'/'symbols' key.",
+    )
+    ap.add_argument(
+        "--universe-name", default=None,
+        help="Override the report's universe label/display name (default: derived from the ticker source).",
+    )
     ap.add_argument("--scores", default=str(DEFAULT_SCORES_FILE))
     ap.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR))
     ap.add_argument("--limit", type=int, default=None, help="Screen only the first N tickers (smoke test)")
     args = ap.parse_args()
 
+    try:
+        symbols, universe_label, universe_display = resolve_ticker_universe(args)
+    except (ValueError, FileNotFoundError) as exc:
+        logger.error("%s", exc)
+        return 2
+
+    if args.limit is not None:
+        symbols = symbols[: args.limit]
+
     payload = run_screen(
+        symbols=symbols,
         market_data_root=Path(args.market_data_root),
-        universe_file=Path(args.universe),
         scores_file=Path(args.scores),
-        limit=args.limit,
+        limit=None,  # limit already applied above so universe_size reflects the resolved source
     )
+    payload["universe_label"] = universe_label
+    payload["universe_display"] = universe_display
 
     report_dir = Path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
     stamp = payload["alpha_as_of"]
-    html_path = report_dir / f"russell1000_factor_verdict_screen_{stamp}.html"
-    json_path = report_dir / f"russell1000_factor_verdict_screen_{stamp}.json"
+    html_path = report_dir / f"factor_verdict_screen_{universe_label}_{stamp}.html"
+    json_path = report_dir / f"factor_verdict_screen_{universe_label}_{stamp}.json"
 
     html_path.write_text(build_screen_html(payload), encoding="utf-8")
 
@@ -919,7 +1166,8 @@ def main() -> int:
     json_payload["rows"] = [asdict(r) for r in payload["rows"]]
     json_path.write_text(json.dumps(json_payload, indent=2, default=str), encoding="utf-8")
 
-    logger.info("succeeded=%d skipped=%d elapsed=%ss", payload["succeeded"], len(payload["skipped"]), payload["elapsed_sec"])
+    logger.info("universe=%s (%s) succeeded=%d skipped=%d elapsed=%ss",
+                universe_display, universe_label, payload["succeeded"], len(payload["skipped"]), payload["elapsed_sec"])
     logger.info("report: %s", html_path)
     logger.info("json:   %s", json_path)
     return 0

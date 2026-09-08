@@ -104,7 +104,9 @@ string can no longer silently render as a capital-preservation stand-aside.
 ## Consumers
 
 - `scripts/visualize_stock_analysis.py::build_buy_timing_verdict_banner_html`
-- `scripts/russell1000_factor_verdict_screen.py::analyse_symbol`
+- `scripts/factor_verdict_screen.py::analyse_symbol` (renamed 2026-09-08 from
+  `russell1000_factor_verdict_screen.py`; generalized to screen any
+  user-supplied ticker universe, default Russell 1000 preserved)
 
 ## Verification
 

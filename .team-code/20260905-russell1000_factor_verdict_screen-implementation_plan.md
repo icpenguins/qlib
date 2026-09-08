@@ -1,5 +1,17 @@
 # Implementation Plan: Russell 1000 Factor + Verdict Cross-Sectional Screen
 
+> **Note (2026-09-08):** The script this plan describes was renamed and
+> generalized to accept any user-supplied instrument list, not only Russell
+> 1000 (Russell 1000 remains the default when no ticker source is given). The
+> current script and spec live at `scripts/factor_verdict_screen.py` /
+> `scripts/factor_verdict_screen.md`. See
+> `.team-code/20260908-factor_verdict_screen_generalization-implementation_plan.md`
+> and the matching walkthrough for the rename. The content below is preserved
+> as the historical record of the 2026-09-05 build and reflects the script's
+> state (and its former `russell1000_factor_verdict_screen.py` filename) as of
+> that date; the price-source evidence and audit findings it documents are
+> still accurate and still apply to the renamed script.
+
 **Date**: 2026-09-05
 **Author**: team-finance (Alpha-Review Framework)
 **Status**: Plan — written before any code, per `.team-code/requirements.md` Part 2

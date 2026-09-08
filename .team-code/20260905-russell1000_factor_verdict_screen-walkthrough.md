@@ -1,5 +1,16 @@
 # Walkthrough: Russell 1000 Factor + Verdict Cross-Sectional Screen (Revision 1)
 
+> **Note (2026-09-08):** The script this walkthrough describes was renamed
+> and generalized to accept any user-supplied instrument list, not only
+> Russell 1000 (Russell 1000 remains the default when no ticker source is
+> given). The current script and spec live at
+> `scripts/factor_verdict_screen.py` / `scripts/factor_verdict_screen.md`. See
+> `.team-code/20260908-factor_verdict_screen_generalization-implementation_plan.md`
+> and its matching walkthrough for the rename. The content below is preserved
+> as the historical record of the 2026-09-05 build and reflects the script's
+> state (and its former `russell1000_factor_verdict_screen.py` filename) as of
+> that date.
+
 **Date**: 2026-09-05
 **Implements**: [20260905-russell1000_factor_verdict_screen-implementation_plan.md](20260905-russell1000_factor_verdict_screen-implementation_plan.md)
 **Status**: Complete. Full 908-name universe screened, 0 skipped.
