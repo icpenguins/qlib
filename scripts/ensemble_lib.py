@@ -21,9 +21,15 @@ This module owns:
   parameter exposes the daily Rank IC series (previously computed then discarded) for
   gate item #2's noise-floor framing, without changing the return shape for existing
   callers that omit the new parameter.
-- ``run_portfolio_backtest``: unchanged default behavior; additive ``open_cost``/
-  ``close_cost``/``deal_price``/``return_positions`` parameters support gate item #7's
-  cost-stress test and item #10's open-price execution variant.
+- ``run_portfolio_backtest``: additive ``open_cost``/``close_cost``/``deal_price``/
+  ``return_positions`` parameters support gate item #7's cost-stress test and item #10's
+  open-price execution variant. ``codes`` (2026-09-09 fix) is a new *required* parameter
+  (raises ``ValueError`` if omitted) carrying the resolved trading universe into
+  ``exchange_kwargs`` -- previously absent, which let ``qlib.backtest.get_exchange()``
+  silently fall back to its own ``codes="all"`` default and fail with
+  ``ValueError: instrument not exists: .../all.txt`` whenever no market named "all"
+  existed in the data directory. All callers must now pass the same ``instruments``
+  value already resolved via ``parse_instruments()``.
 - ``build_and_train_models`` / ``blend_predictions`` / ``_json_safe``: unchanged.
 - ``assert_sufficient_training_budget``: new, gate item #1's guard. Lives here and only
   here (single home, per the plan's Section 3 circular-import correction).
@@ -88,6 +94,68 @@ def parse_instruments(instruments_arg: str, data_dir: Path) -> Union[str, List[s
         f"and --data_dir path."
     )
     return [inst_str.upper()]
+
+
+def find_available_benchmark(
+    candidates: List[str],
+    start_time: str,
+    end_time: str,
+) -> Optional[str]:
+    """
+    Return the first candidate symbol for which Qlib's currently-initialized
+    provider actually has usable benchmark-return data, or None if none do.
+
+    Exists because a benchmark symbol picked without checking the actual data
+    directory fails deep inside `qlib.backtest.report.PortfolioMetrics.init_bench`
+    (`ValueError: The benchmark [...] does not exist`) -- only after a full
+    training run has already completed. `--data_dir`s built from a specific
+    ticker universe (e.g. an S&P 500 constituents-only download) commonly don't
+    include the ETF/index ticker a default benchmark assumes (SPY tracks the
+    S&P 500 but is not itself a constituent of it), so this is a real,
+    recurring case, not a hypothetical one.
+
+    Checks using the *exact* expression and function
+    `qlib.backtest.report.PortfolioMetrics._cal_benchmark` itself evaluates
+    (`$close/Ref($close,1)-1` via `qlib.utils.resam.get_higher_eq_freq_feature`)
+    -- not a simpler raw-`$close` check, which can disagree at real edge cases
+    (e.g. a symbol with exactly one row of data in the window: raw `$close`
+    would look "usable" while the actual required `Ref($close,1)`-shifted
+    return is all-NaN, so the real backtest step would still fail even though
+    this pre-check passed). Matching qlib's own check verbatim means this
+    function can never give an answer that disagrees with what the real
+    downstream call will do. Requires `qlib.init(...)` to have already run
+    against the target `--data_dir` before this is called.
+
+    Parameters
+    ----------
+    candidates : List[str]
+        Symbols to try, in priority order (e.g. an explicit `--benchmark`
+        first, then a fallback list).
+    start_time, end_time : str
+        A date range to probe -- ideally the run's actual train/test window,
+        so a candidate with data for only part of history doesn't pass.
+
+    Returns
+    -------
+    Optional[str]
+        The first candidate with real (non-empty) benchmark-return data over
+        the given window, or None if none qualify.
+    """
+    from qlib.utils.resam import get_higher_eq_freq_feature
+
+    for sym in candidates:
+        try:
+            result, _ = get_higher_eq_freq_feature(
+                [sym], ["$close/Ref($close,1)-1"], start_time, end_time, freq="day"
+            )
+        except Exception as e:
+            logger.debug(f"    Benchmark candidate '{sym}' rejected (query error: {e}).")
+            continue
+        if result is None or len(result) == 0:
+            logger.debug(f"    Benchmark candidate '{sym}' rejected (no usable data in this window).")
+            continue
+        return sym
+    return None
 
 
 def audit_universe_bias(
@@ -385,6 +453,7 @@ def _failed_backtest_result(error: Exception) -> Dict[str, Any]:
 def run_portfolio_backtest(
     pred_series: pd.Series,
     benchmark: str,
+    codes: Optional[Union[str, List[str]]] = None,
     topk: int = 50,
     n_drop: int = 5,
     annualization_n: int = 252,
@@ -407,6 +476,27 @@ def run_portfolio_backtest(
 
     Parameters
     ----------
+    codes : Optional[Union[str, List[str]]]
+        The exact resolved trading universe to backtest against -- the same shape
+        ``parse_instruments()`` already returns (an explicit ticker list, or a market-name
+        string that resolves to a real ``<data_dir>/instruments/<name>.txt``). Threaded
+        straight into ``exchange_kwargs["codes"]`` for the underlying ``backtest_daily()``
+        call, which forwards it to ``qlib.backtest.get_exchange()``.
+
+        Required -- no silent default. ``get_exchange()``'s own signature defaults
+        ``codes="all"`` when not supplied, and ``Exchange.get_quote_from_qlib()``
+        (``qlib/backtest/exchange.py``) passes that literal string straight into
+        ``D.features(self.codes, ...)``, which qlib resolves as a MARKET NAME, not a
+        wildcard -- i.e. it looks for ``<data_dir>/instruments/all.txt``. If that file
+        doesn't exist (e.g. renamed to a differently-named universe file, as happened in
+        practice), this raises ``ValueError: instrument not exists: .../all.txt`` deep
+        inside the backtest, well after training has already completed. Worse, if an
+        unrelated ``all.txt`` *does* happen to exist, this would silently backtest the
+        wrong universe instead of the one actually resolved/audited earlier in the run --
+        a correctness failure a caller could easily miss. Omitting this parameter raises
+        immediately with an actionable message rather than either of those outcomes; pass
+        the same ``instruments`` value the caller already resolved via
+        ``parse_instruments()`` (do not re-resolve it a second time).
     open_cost, close_cost : float
         Additive parameters (defaults match the previously-hardcoded 0.0001/0.0001) so gate
         item #7's cost-stress test can call this function twice at different cost levels
@@ -421,6 +511,18 @@ def run_portfolio_backtest(
         (or None if the backtest failed before positions were computed) as a second return
         value, so gate item #7 can compute turnover from it without a second backtest call.
     """
+    if codes is None:
+        raise ValueError(
+            "run_portfolio_backtest() requires `codes` (the resolved trading universe, i.e. "
+            "the same value ensemble_lib.parse_instruments() already returned earlier in this "
+            "run) -- refusing to silently fall back to qlib's own get_exchange() default of "
+            "codes=\"all\", which resolves to <data_dir>/instruments/all.txt and will either "
+            "crash with 'ValueError: instrument not exists: .../all.txt' (if that file doesn't "
+            "exist) or silently backtest the wrong universe (if an unrelated all.txt does). "
+            "Pass the already-resolved `instruments` variable from your caller's main() -- do "
+            "not re-resolve it a second time."
+        )
+
     dt_index = pred_series.index.get_level_values("datetime")
     start_time = str(dt_index.min())[:10]
     end_time = str(dt_index.max())[:10]
@@ -453,6 +555,7 @@ def run_portfolio_backtest(
                     "open_cost": open_cost,
                     "close_cost": close_cost,
                     "min_cost": 0,
+                    "codes": codes,
                 },
             )
         # Qlib's own convention (see qlib.workflow.record_temp.PortAnaRecord): "return" is

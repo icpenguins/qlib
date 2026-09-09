@@ -69,6 +69,7 @@ from ensemble_lib import (
     build_and_train_models,
     build_dataset,
     calc_ic_metrics,
+    find_available_benchmark,
     parse_instruments,
     run_portfolio_backtest,
     _json_safe,
@@ -122,6 +123,20 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--benchmark", type=str, default="SPY", help="Benchmark symbol.")
+    parser.add_argument(
+        "--benchmark_candidates",
+        type=str,
+        default="SPY,^GSPC,VOO,IVV,QQQ",
+        help=(
+            "Comma-separated fallback symbols to search (in order) if --benchmark has no usable "
+            "$close data in --data_dir. Checked with qlib.data.D.features against the actual "
+            "provider before training starts, so a bad/missing benchmark (e.g. SPY absent from a "
+            "constituents-only universe download, since the ETF isn't itself an index constituent) "
+            "fails fast with a clear message instead of deep inside the backtest step after a full "
+            "training run has already completed. The first candidate with real data wins; pass a "
+            "single known-good symbol here (or in --benchmark) to skip searching."
+        ),
+    )
     parser.add_argument("--train_start", type=str, default="2020-01-01", help="Train start date.")
     parser.add_argument("--train_end", type=str, default="2023-12-31", help="Train end date.")
     parser.add_argument("--valid_start", type=str, default="2024-01-01", help="Validation start date.")
@@ -209,6 +224,30 @@ def main():
     logger.info(f"Initializing Qlib (Provider: {data_path}, Region: us)...")
     qlib.init(provider_uri=str(data_path), region="us")
 
+    # Resolve and verify the benchmark BEFORE spending any time training: a bad benchmark
+    # otherwise fails deep inside qlib.backtest.report.PortfolioMetrics.init_bench, after a full
+    # training run has already completed (see --benchmark_candidates' help text for why this is a
+    # real, recurring case -- not hypothetical -- with a constituents-only universe download).
+    resolved_benchmark = find_available_benchmark(
+        [args.benchmark], start_time=args.train_start, end_time=args.test_end
+    )
+    if resolved_benchmark is None:
+        candidates = [c.strip() for c in args.benchmark_candidates.split(",") if c.strip()]
+        logger.warning(
+            f"Benchmark '{args.benchmark}' has no usable $close data in {data_path} -- "
+            f"searching --benchmark_candidates ({candidates})..."
+        )
+        resolved_benchmark = find_available_benchmark(candidates, start_time=args.train_start, end_time=args.test_end)
+        if resolved_benchmark is None:
+            raise RuntimeError(
+                f"No usable benchmark found. Tried '{args.benchmark}' and candidates {candidates}, none of "
+                f"which have $close data in {data_path} over {args.train_start}..{args.test_end}. Pass "
+                f"--benchmark <symbol already present in this data directory> (e.g. a ticker from your "
+                f"--market universe itself), or download the desired benchmark symbol into this data_dir first."
+            )
+        logger.info(f"Resolved benchmark: '{resolved_benchmark}' (--benchmark '{args.benchmark}' was unavailable).")
+    args.benchmark = resolved_benchmark
+
     # Resolve instruments
     instruments = parse_instruments(args.market, data_path)
     models_to_run = [m.strip().lower() for m in args.models.split(",") if m.strip()]
@@ -258,7 +297,9 @@ def main():
     results_table = []
     for model_name, pred_series in predictions.items():
         ic_stats = calc_ic_metrics(pred_series, test_label)
-        bt_stats = run_portfolio_backtest(pred_series, benchmark=args.benchmark, deal_price=variant["deal_price"])
+        bt_stats = run_portfolio_backtest(
+            pred_series, benchmark=args.benchmark, codes=instruments, deal_price=variant["deal_price"]
+        )
         results_table.append({
             "Model": model_name,
             "IC": ic_stats["IC"],

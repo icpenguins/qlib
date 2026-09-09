@@ -425,6 +425,7 @@ def _compute_daily_turnover(positions_normal: Any) -> pd.Series:
 def compute_turnover_and_cost_stress(
     pred_series: pd.Series,
     benchmark: str,
+    codes: Union[str, List[str]],
     baseline_bp: float = 1.0,
     stress_bp: float = 10.0,
     deal_price: str = "close",
@@ -438,6 +439,13 @@ def compute_turnover_and_cost_stress(
     open_cost=, close_cost=)`` twice (baseline vs. stress bp) to compare
     `information_ratio_net` degradation. `deal_price` should match whichever label variant is
     being diagnosed (Section 8 of the plan).
+
+    `codes` : Union[str, List[str]]
+        The already-resolved trading universe (``ensemble_lib.parse_instruments()``'s return
+        value from ``run_diagnostics()``) -- forwarded verbatim to both
+        ``run_portfolio_backtest()`` calls below, which now require it explicitly (see that
+        function's docstring for why: qlib's own unset-``codes`` default resolves to a market
+        name, ``<data_dir>/instruments/all.txt``, not a wildcard).
     """
     baseline_cost = baseline_bp / 10000.0
     stress_cost = stress_bp / 10000.0
@@ -445,6 +453,7 @@ def compute_turnover_and_cost_stress(
     baseline_result, positions_normal = ensemble_lib.run_portfolio_backtest(
         pred_series,
         benchmark=benchmark,
+        codes=codes,
         topk=topk,
         n_drop=n_drop,
         annualization_n=annualization_n,
@@ -456,6 +465,7 @@ def compute_turnover_and_cost_stress(
     stress_result = ensemble_lib.run_portfolio_backtest(
         pred_series,
         benchmark=benchmark,
+        codes=codes,
         topk=topk,
         n_drop=n_drop,
         annualization_n=annualization_n,
@@ -701,7 +711,9 @@ def run_diagnostics(
 
     # --- Item #7: turnover / cost stress, per prediction series.
     turnover_cost = {
-        model_name: compute_turnover_and_cost_stress(pred, benchmark=args.benchmark, deal_price=deal_price)
+        model_name: compute_turnover_and_cost_stress(
+            pred, benchmark=args.benchmark, codes=instruments, deal_price=deal_price
+        )
         for model_name, pred in predictions.items()
     }
     report["turnover_cost"] = turnover_cost
