@@ -537,6 +537,27 @@ def build_dataset(
         "fit_start_time": args.train_start,
         "fit_end_time": args.train_end,
         "instruments": instruments,
+        # Alpha158's own class default is `infer_processors=[]` -- i.e. the 158
+        # raw features are never sanitized (this matches Qlib's canonical
+        # CSI300 benchmark config too; see .team-code/train_alpha158_lightgbm.md
+        # section 2.2, where this was independently ruled out as the cause of
+        # a *different* issue, score-collapse). Left at [], a handful of
+        # ratio-style features (e.g. dividing by a rolling std that is exactly
+        # 0) can genuinely be +-inf for some (date, symbol) rows. LightGBM's
+        # histogram binning tolerates raw inf silently; XGBoost's DMatrix
+        # construction validates against it and raises
+        # ("Input data contains `inf` ... while `missing` is not set to
+        # `inf`") -- it isn't wrong to do so, it's XGBoost surfacing a data
+        # problem LightGBM was quietly absorbing. `ProcessInf` is Qlib's own
+        # mechanism for exactly this (qlib/data/dataset/processor.py) --
+        # already qlib's own default for the Alpha360 handler -- and replaces
+        # +-inf with that date's cross-sectional mean of the finite values,
+        # rather than leaving raw infinities for only some learners to choke
+        # on. This does not reintroduce the score-collapse hypothesis already
+        # ruled out: that was about CSZScoreNorm rescaling the *label*, this
+        # is strictly a raw-feature inf/data-hygiene fix and touches neither
+        # the label nor the feature scale.
+        "infer_processors": [{"class": "ProcessInf", "kwargs": {}}],
     }
     if label_config is not None:
         handler_kwargs["label"] = label_config
