@@ -23,6 +23,7 @@ from download_us_selected_data import (
     INDEX_ALIASES,
     parse_symbols,
     load_symbols_from_file,
+    load_membership_windows_from_file,
     normalize_symbol_data,
     dump_to_qlib_format,
     build_parser,
@@ -167,6 +168,102 @@ class TestDownloadUSSelectedData(unittest.TestCase):
             # Index 0 is start_index in calendar (1 for NVDA)
             self.assertEqual(nvda_arr[0], 1.0)
             np.testing.assert_allclose(nvda_arr[1:], [1.00, 1.10], rtol=1e-4)
+
+    def test_load_membership_windows_from_file(self):
+        """
+        Regression test for the 2026-09-09 fix: a source CSV's real 'Date Added'/
+        'Date Removed' columns (e.g. an S&P 500 constituents export) must be
+        read, not silently discarded the way `load_symbols_from_file` alone
+        discards every non-ticker column.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "constituents.csv"
+            csv_path.write_text(
+                "Ticker,Date Added,Date Removed\n"
+                "AAPL,1982-11-30,\n"          # still a member -> no removal date
+                "AAL,2015-03-23,2024-09-23\n"  # removed -> real delisting date
+                "MSFT,1994-06-01,\n",
+                encoding="utf-8",
+            )
+            windows = load_membership_windows_from_file(csv_path)
+            self.assertEqual(windows["AAPL"], ("1982-11-30", None))
+            self.assertEqual(windows["AAL"], ("2015-03-23", "2024-09-23"))
+            self.assertEqual(windows["MSFT"], ("1994-06-01", None))
+
+    def test_load_membership_windows_from_file_no_recognized_columns(self):
+        """A plain ticker-only CSV (no Date Added/Removed columns) yields {}."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "tickers.csv"
+            csv_path.write_text("Ticker\nAAPL\nMSFT\n", encoding="utf-8")
+            self.assertEqual(load_membership_windows_from_file(csv_path), {})
+
+    def test_dump_to_qlib_format_with_membership_windows(self):
+        """
+        instruments/all.txt's (start, end) should reflect a supplied membership
+        window rather than the full downloaded price-data range, while the
+        feature .bin files still cover the FULL price-data range unchanged.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            dates = ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
+            df_aal = pd.DataFrame({
+                "date": dates,
+                "symbol": ["AAL"] * 4,
+                "open": [1.0, 1.0, 1.0, 1.0],
+                "high": [1.0, 1.0, 1.0, 1.0],
+                "low": [1.0, 1.0, 1.0, 1.0],
+                "close": [1.0, 1.1, 1.2, 1.3],
+                "volume": [100.0, 100.0, 100.0, 100.0],
+                "factor": [1.0, 1.0, 1.0, 1.0],
+                "change": [0.0, 0.1, 0.09, 0.08],
+            })
+            # AAL "removed" partway through the downloaded price history --
+            # the real, common case (the company keeps trading; only its INDEX
+            # membership ends).
+            windows = {"AAL": ("2024-01-02", "2024-01-04")}
+            dump_to_qlib_format({"AAL": df_aal}, tmp_path, freq="day", membership_windows=windows)
+
+            inst_lines = (tmp_path / "instruments" / "all.txt").read_text(encoding="utf-8").strip().splitlines()
+            sym, s_dt, e_dt = inst_lines[0].split("\t")
+            self.assertEqual((sym, s_dt, e_dt), ("AAL", "2024-01-02", "2024-01-04"))
+
+            # Bins are NOT truncated to the membership window -- all 4 days remain.
+            close_bin = tmp_path / "features" / "AAL" / "close.day.bin"
+            arr = np.fromfile(str(close_bin), dtype="<f")
+            np.testing.assert_allclose(arr[1:], [1.0, 1.1, 1.2, 1.3], rtol=1e-4)
+
+    def test_dump_to_qlib_format_guards_against_inverted_membership_window(self):
+        """
+        Regression test for the ADT case found while fixing this: a ticker
+        symbol reused by an unrelated listing can have a membership window
+        that doesn't overlap the downloaded price-data range at all. Clamping
+        each end independently would then produce an inverted (start > end)
+        row. The full price-data range must be kept instead, not a broken row.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            dates = ["2024-01-02", "2024-01-03", "2024-01-04"]
+            df = pd.DataFrame({
+                "date": dates,
+                "symbol": ["ADT"] * 3,
+                "open": [1.0, 1.0, 1.0],
+                "high": [1.0, 1.0, 1.0],
+                "low": [1.0, 1.0, 1.0],
+                "close": [1.0, 1.0, 1.0],
+                "volume": [100.0, 100.0, 100.0],
+                "factor": [1.0, 1.0, 1.0],
+                "change": [0.0, 0.0, 0.0],
+            })
+            # An old membership stint that predates all of this ticker's
+            # currently-downloaded price history (a different corporate entity).
+            windows = {"ADT": ("2012-10-01", "2016-05-03")}
+            dump_to_qlib_format({"ADT": df}, tmp_path, freq="day", membership_windows=windows)
+
+            inst_lines = (tmp_path / "instruments" / "all.txt").read_text(encoding="utf-8").strip().splitlines()
+            sym, s_dt, e_dt = inst_lines[0].split("\t")
+            self.assertLessEqual(s_dt, e_dt, "instruments row must never be inverted")
+            # Falls back to the full, unclamped price-data range.
+            self.assertEqual((s_dt, e_dt), ("2024-01-02", "2024-01-04"))
 
     def test_load_symbols_from_txt_file(self):
         """Test loading symbols from a text file with comments and mixed delimiters."""

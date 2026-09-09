@@ -54,7 +54,7 @@ import datetime
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Union
+from typing import Any, List, Dict, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -66,6 +66,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("USDataDownloader")
+
+# Column-name aliases accepted for the two membership-window fields. Matched
+# case-insensitively against a stripped column header.
+MEMBERSHIP_START_COLS = ("date added", "added", "start date", "membership_start")
+MEMBERSHIP_END_COLS = ("date removed", "removed", "end date", "delisted", "membership_end")
 
 # Default targeted US symbols requested by user
 DEFAULT_US_SYMBOLS: List[str] = [
@@ -190,6 +195,84 @@ def load_symbols_from_file(file_path: Union[str, Path]) -> List[str]:
     symbols = parse_symbols(raw_symbols)
     logger.info(f"Loaded {len(symbols)} tickers from file: {symbols}")
     return symbols
+
+def load_membership_windows_from_file(
+    file_path: Union[str, Path],
+) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    """
+    Read a per-ticker index-membership window (add date / remove date) from a
+    CSV, when present, keyed by whichever ticker column `load_symbols_from_file`
+    would itself select.
+
+    This exists to close a specific survivorship-bias gap: a source CSV such as
+    an S&P 500 constituents export commonly carries genuine point-in-time
+    "Date Added" / "Date Removed" columns (the real historical index
+    add/drop record), but `load_symbols_from_file` only ever extracts the
+    ticker column -- every other column, including this one, was previously
+    discarded before `dump_to_qlib_format` ever ran. The instruments file it
+    writes then fell back to "first/last date we happen to have price data
+    for", which for any still-publicly-traded company (the overwhelming
+    majority, even among names long since removed from an INDEX) is simply
+    "today" -- silently reproducing exactly the "today's membership
+    back-projected across history" pattern `ensemble_lib.py::audit_universe_bias`
+    exists to catch.
+
+    Returns
+    -------
+    Dict[str, Tuple[Optional[str], Optional[str]]]
+        Ticker -> (membership_start_date, membership_end_date), each either an
+        'YYYY-MM-DD' string or None (column absent / blank cell for that row,
+        e.g. a name that has not been removed and so has no removal date).
+        Empty dict if the file isn't a CSV, can't be parsed, or has neither
+        recognized column.
+    """
+    path = Path(file_path).expanduser().resolve()
+    if not path.is_file() or path.suffix.lower() != ".csv":
+        return {}
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        logger.debug(f"Membership-window CSV parsing skipped: {e}")
+        return {}
+
+    cols_lower = {str(c).strip().lower(): c for c in df.columns}
+    ticker_col = next(
+        (cols_lower[c] for c in ("symbol", "ticker", "code", "instrument", "stock") if c in cols_lower),
+        None,
+    )
+    start_col = next((cols_lower[c] for c in MEMBERSHIP_START_COLS if c in cols_lower), None)
+    end_col = next((cols_lower[c] for c in MEMBERSHIP_END_COLS if c in cols_lower), None)
+
+    if ticker_col is None or (start_col is None and end_col is None):
+        return {}
+
+    def _clean_date(v: Any) -> Optional[str]:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "nat", "none"):
+            return None
+        try:
+            return pd.to_datetime(s).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    windows: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    for _, row in df.iterrows():
+        sym = str(row[ticker_col]).strip().upper()
+        if not sym or sym.lower() == "nan":
+            continue
+        s_val = _clean_date(row[start_col]) if start_col is not None else None
+        e_val = _clean_date(row[end_col]) if end_col is not None else None
+        windows[sym] = (s_val, e_val)
+
+    n_with_end = sum(1 for _, e in windows.values() if e is not None)
+    logger.info(
+        f"Loaded index-membership windows for {len(windows)} tickers from {path} "
+        f"({n_with_end} carry a real removal/delisting date)."
+    )
+    return windows
 
 
 def parse_symbols(symbol_input: Union[str, List[str], Path]) -> List[str]:
@@ -580,6 +663,7 @@ def dump_to_qlib_format(
     normalized_dfs: Dict[str, pd.DataFrame],
     qlib_dir: Union[str, Path],
     freq: str = "day",
+    membership_windows: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
 ) -> None:
     """
     Dump normalized DataFrames into Qlib binary format (.bin) with calendars and instruments.
@@ -608,6 +692,18 @@ def dump_to_qlib_format(
         Target directory for Qlib data provider.
     freq : str, optional
         Data frequency, by default 'day'.
+    membership_windows : Optional[Dict[str, Tuple[Optional[str], Optional[str]]]]
+        Per-symbol (index_add_date, index_remove_date), from
+        `load_membership_windows_from_file`. When given for a symbol, the
+        instruments/all.txt row's (start_date, end_date) reflects genuine
+        index-membership dates rather than raw price-data availability --
+        clamped to the range price data actually covers, since membership
+        can't be claimed on a date with no data to serve. The underlying
+        feature .bin files are unaffected either way: they always cover the
+        full downloaded price history, so this only tightens the point-in-time
+        window Qlib's instrument filtering uses, without discarding data.
+        Symbols absent from this dict keep the prior behavior (full available
+        price-data range) unchanged.
     """
     qlib_path = Path(qlib_dir).expanduser().resolve()
     cal_dir = qlib_path.joinpath("calendars")
@@ -668,7 +764,46 @@ def dump_to_qlib_format(
 
         start_date = df_sorted.index[0]
         end_date = df_sorted.index[-1]
-        instruments_data.append((symbol_upper, start_date, end_date))
+
+        # instruments/all.txt's (start, end) is a separate concept from the
+        # price-data range used below to align the feature bins: it should
+        # reflect genuine index-membership window when known, not merely "we
+        # happen to have a price for this date" (see `membership_windows`'s
+        # docstring on `dump_to_qlib_format`). The bins themselves always keep
+        # the FULL price-data range regardless -- only this file's point-in-time
+        # metadata narrows.
+        inst_start_date, inst_end_date = start_date, end_date
+        mem_window = (membership_windows or {}).get(symbol_upper)
+        if mem_window is not None:
+            mem_start, mem_end = mem_window
+            candidate_start, candidate_end = inst_start_date, inst_end_date
+            if mem_start is not None:
+                candidate_start = max(start_date, mem_start)
+            if mem_end is not None:
+                candidate_end = min(end_date, mem_end)
+            # Guard against a membership window that doesn't actually overlap
+            # the downloaded price-data range -- this happens for real (not
+            # hypothetically) when a ticker symbol was reused by an unrelated
+            # listing after the membership record's era (e.g. a company
+            # delisted, then a different company later relisted under the same
+            # ticker): clamping both ends independently can then produce an
+            # inverted (start > end) window. Rather than write a broken
+            # instruments row, discard the membership constraint for this one
+            # symbol and keep the safe (if survivorship-biased) full
+            # price-data range, with a loud warning so it can be fixed in the
+            # source CSV (e.g. by disambiguating reused tickers) rather than
+            # silently corrupting the instruments file.
+            if candidate_start <= candidate_end:
+                inst_start_date, inst_end_date = candidate_start, candidate_end
+            else:
+                logger.warning(
+                    f"Membership window for {symbol_upper} ({mem_start} -> {mem_end}) does not "
+                    f"overlap its downloaded price-data range ({start_date} -> {end_date}) -- "
+                    f"likely a reused ticker symbol from an unrelated era. Falling back to the "
+                    f"full price-data range for this symbol's instruments/all.txt row; it will "
+                    f"still be survivorship-biased and should be fixed at the source-CSV level."
+                )
+        instruments_data.append((symbol_upper, inst_start_date, inst_end_date))
 
         # Align with calendar range between start_date and end_date
         start_idx = date_to_idx[start_date]
@@ -712,6 +847,7 @@ def run_pipeline(
     delay: float = 0.5,
     download_options: bool = False,
     download_events: bool = False,
+    membership_windows: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     Execute the full end-to-end data acquisition and processing pipeline.
@@ -740,6 +876,12 @@ def run_pipeline(
         Whether to generate Qlib binary dataset.
     delay : float
         Inter-request sleep delay in seconds.
+    membership_windows : Optional[Dict[str, Tuple[Optional[str], Optional[str]]]]
+        Per-symbol (index_add_date, index_remove_date) -- see
+        `load_membership_windows_from_file` and `dump_to_qlib_format`. Pass
+        this through when the symbol source carries real point-in-time
+        membership dates, so instruments/all.txt reflects true historical
+        add/drop dates instead of raw price-data availability.
 
     Returns
     -------
@@ -811,7 +953,12 @@ def run_pipeline(
     # Dump to Qlib binary format if requested
     if dump_qlib and results:
         logger.info("Dumping normalized data into Qlib binary format...")
-        dump_to_qlib_format(results, qlib_dir=qlib_path, freq="day" if interval == "1d" else "1min")
+        dump_to_qlib_format(
+            results,
+            qlib_dir=qlib_path,
+            freq="day" if interval == "1d" else "1min",
+            membership_windows=membership_windows,
+        )
         logger.info(f"Qlib binary dump completed successfully at: {qlib_path}")
 
     # Download equity option chains if requested
@@ -975,8 +1122,15 @@ def main():
     args = parser.parse_args()
 
     # Determine symbols source: --symbol_file, --symbols, or default list
+    membership_windows: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     if args.symbol_file:
         symbols = load_symbols_from_file(args.symbol_file)
+        # If the same file also carries real index add/remove dates (e.g. an
+        # S&P 500 constituents export with "Date Added"/"Date Removed"
+        # columns), use them for instruments/all.txt's point-in-time window
+        # instead of raw price-data availability -- see
+        # `load_membership_windows_from_file`'s docstring for why this matters.
+        membership_windows = load_membership_windows_from_file(args.symbol_file)
     elif args.symbols:
         symbols = parse_symbols(args.symbols)
     else:
@@ -998,6 +1152,7 @@ def main():
         delay=args.delay,
         download_options=args.download_options,
         download_events=args.download_events,
+        membership_windows=membership_windows,
     )
 
 
