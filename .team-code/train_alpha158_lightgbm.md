@@ -88,6 +88,88 @@ unconditionally. It now:
 Full design, thresholds, and rationale:
 [validate_score_quality.md](validate_score_quality.md).
 
+## 2.4 Root cause of the 2026-09-07/08 catastrophic failure: a stale/truncated
+qlib binary-store calendar, not LightGBM nondeterminism (2026-09-08, follow-up)
+
+The 2026-09-08 unmodified-config retrain (`.team-code/walkthroughs/walkthrough-r3.md`,
+Section 4) failed the new gate with `num_trees=8`, `information_ratio=-2.02`,
+`max_drawdown=-44%`, and `ffr=nan`, and that walkthrough recorded an
+**unverified working hypothesis** that unpinned LightGBM seeds under
+`num_threads=16` were responsible. A dedicated follow-up investigation
+disconfirmed that hypothesis with direct evidence and found the real cause:
+
+**Nondeterminism, disconfirmed.** Three independent process invocations of the
+exact unmodified retrain command, run back-to-back on 2026-09-08, produced
+**bit-identical** results to 16 significant figures (`ic=0.008401536470462791`,
+`rank_ic=0.0023225113642203507`, `num_trees=8`, identical portfolio metrics
+down to the last digit) every time. LightGBM's own seed defaults
+(`seed`/`bagging_seed`/`feature_fraction_seed`/`data_random_seed`) are fixed
+constants in its C++ `Config`, not randomized, when left unset, so this
+environment was never actually nondeterministic. This also explains why the
+three 2026-09-05 "healthy baseline" runs (`362c9610`/`605c0c64`/`b3537e20`)
+were themselves bit-identical to each other -- the same determinism, just at a
+different (correct) data state.
+
+**Real root cause: `D:/trading/qlib/qlib_data/calendars/day.txt` was stale and
+truncated relative to the per-ticker binary feature files.** Confirmed via a
+timing/mtime audit of the external qlib data store (not tracked by this repo's
+git): every ticker's `.day.bin` files carry `start_index=0.0` and `1930`
+values (spanning 2019-01-02 -> 2026-09-04, matching `source/*.csv` and
+`normalize/*.csv` exactly), but `calendars/day.txt` had only **1500** entries
+starting **2020-09-16** -- the exact misalignment already documented (but not
+repaired) in
+[20260905-russell1000_factor_verdict_screen-walkthrough.md](20260905-russell1000_factor_verdict_screen-walkthrough.md)'s
+Finding 1. Per-file mtimes on the store showed the corrupted calendar (plus
+`instruments/all.txt` and a newly-added `features/SNOW/*`) was written at
+2026-09-06 00:57 UTC -- **after** the last "healthy" baseline run (`362c9610`,
+ended 2026-09-05 23:33 UTC) and **before** every subsequent run, including the
+2026-09-08 failure. `SNOW`'s own post-fix `start_index=430` against the
+corrected 1930-entry calendar lands exactly on the old calendar's start date,
+indicating whatever process added `SNOW` to the store rebuilt `day.txt` from a
+single ticker's date range instead of the union across all 909 tickers --
+silently truncating the calendar 430 trading days forward for every other
+name and shifting `D.features()`'s date-index mapping for 857/909 tickers.
+
+**Fix applied**: re-ran Qlib's own `scripts/dump_bin.py dump_all` against the
+already-correct, already-verified `normalize/*.csv` files (which were never
+themselves corrupted -- only the derived binary calendar was), writing a fresh
+`calendars/day.txt` (1930 entries, 2019-01-02 -> 2026-09-04, now consistent
+with every `.day.bin` file's `start_index`/length) with `--backup_dir`
+preserving the pre-fix store byte-for-byte at
+`D:/trading/qlib/qlib_data_backup_20260908_broken_calendar/`. This only
+rewrites `calendars/`, `features/`, and `instruments/all.txt`; the
+manually-curated `instruments/russell1000.txt` (already correct -- it recorded
+each ticker's true 2019-01-02 -> 2026-09-04 span all along) and the unrelated
+`events/`/`options/` subdirectories were untouched. Verified post-fix:
+`D.features(['AAPL'], ['$close'], end_time='2026-09-04')` now returns
+`8.546910` (the true value) instead of the pre-fix `6.6574` (which actually
+belonged to 2024-12-16).
+
+**Outcome after the fix**: three more repeated invocations of the exact
+unmodified retrain (still no config/hyperparameter change) were, again,
+bit-identical to each other, and reproduced the 2026-09-05 "healthy baseline"
+numbers exactly (`ic=0.008004342501323756`, `rank_ic=0.010932338795831296`,
+`information_ratio=1.4947`, `annualized_return=+29.71%`,
+`max_drawdown=-12.5%`, `ffr=1.0`, `num_trees=38`). The catastrophic failure
+modes (NaN fill rate, -44% drawdown, IR -2.02, 8-tree model) are gone and do
+not recur. **The gate still fails** on two checks that were never evaluated
+against the historical baseline before this session's new gate existed:
+`num_trees=38 < 50` and score distinctness (`distinct_fraction=0.2555`,
+`dominant_share=0.1322`, both short of the `>=0.95`/`<=0.02` bar) -- vastly
+improved from the pre-fix run (`distinct_fraction=0.05`, `dominant_share=0.79`)
+but not passing. This appears to be a pre-existing characteristic of the
+current hyperparameters (already reduced from the extreme
+`lambda_l1=205.7`/`lambda_l2=580.98` documented in
+[20260905-finance_team_review_alpha158_degenerate_score.md](20260905-finance_team_review_alpha158_degenerate_score.md)
+down to `lambda_l1=0.1`/`lambda_l2=1.0`) applied to a real, low-signal daily
+return-prediction task, not a new bug -- but changing hyperparameters further
+to clear this bar is a model-design decision, not a bug fix, and per this
+session's own constraints was correctly left to a dedicated, `@team-finance`-
+reviewed follow-up rather than iterated on unilaterally to force a pass. No
+reference has been blessed and production remains the pre-existing
+`145fb751` artifact; see
+[walkthrough-r4.md](walkthroughs/walkthrough-r4.md) for the full record.
+
 ## 3. Usage & CLI Options
 ```bash
 # Standard training using default US Russell 1000 workflow. Only a run that
